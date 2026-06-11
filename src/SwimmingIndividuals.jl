@@ -33,6 +33,7 @@ using NearestNeighbors
 using QuadGK
 using Printf
 using HDF5
+using Serialization
 
 # Specific sub-components and hardware abstraction tools
 using PlanktonIndividuals.Grids
@@ -45,6 +46,7 @@ using CUDA: @atomic, atomic_cas!, atomic_sub!, @cuprintf
 # The order of inclusion is critical to ensure types and utilities are 
 # defined before they are used by high-level logic.
 include("utilities.jl")   # General helper functions and math
+include("asc_environment.jl") # Model-native XML / ESRI .asc time-varying forcing (defines ENV_FORCING)
 include("create.jl")      # Agent and Resource construction/initialization
 include("environment.jl") # NetCDF loading and habitat suitability
 include("simulation.jl")  # Simulation and Model structs
@@ -76,6 +78,15 @@ export
     generate_environment!,
     generate_individuals,
     initialize_resources,
-    load_fisheries
+    load_fisheries,
+
+    # Checkpoint / Restart
+    save_checkpoint,
+    load_checkpoint!,
+
+    # Time-varying ASC environmental forcing
+    load_env_forcing,
+    update_environment_from_asc!,
+    parse_env_config
 
 end # module SwimmingIndividuals

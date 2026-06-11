@@ -2,6 +2,27 @@
 # Core Data Structures
 # ===================================================================
 
+# Gated progress printing (verbose flag in RUNTIME_CONFIG; safe if undefined yet).
+function vprint(args...)
+    (isdefined(@__MODULE__, :RUNTIME_CONFIG) && get(RUNTIME_CONFIG, :verbose, 1) != 0) && print(args...)
+end
+function vprintln(args...)
+    (isdefined(@__MODULE__, :RUNTIME_CONFIG) && get(RUNTIME_CONFIG, :verbose, 1) != 0) && println(args...)
+end
+
+# Cached CSV reader: input files don't change during a run, so parse once and
+# reuse. Eliminates repeated disk reads in hot loops with no change in results.
+const _CSV_CACHE = Dict{String, Any}()
+function cached_csv(path::AbstractString)
+    key = abspath(String(path))
+    get!(_CSV_CACHE, key) do
+        CSV.read(key, DataFrame)
+    end
+end
+clear_csv_cache!() = (empty!(_CSV_CACHE); nothing)
+cached_csv_for(files, label::AbstractString) =
+    cached_csv(files[files.File .== label, :Destination][1])
+
 # Struct for a single species' agents and parameters
 mutable struct plankton
     data::AbstractArray
@@ -46,6 +67,17 @@ mutable struct Fishery
     quota::Float32
     cumulative_catch::Float32
     cumulative_inds::Int32
+    # --- Quota rule (dynamic harvest control) ---
+    # quota_mode: 1 = fixed annual quota (quota held constant, as before);
+    #             2 = biomass-linked rate, recomputed each year on Jan 1 as
+    #                 quota = harvest_rate * (current target-species biomass, mt),
+    #                 so the fishery grows/shrinks with the stock.
+    quota_mode::Int32
+    harvest_rate::Float32      # annual exploitation fraction of target biomass (mode 2)
+    quota_min::Float32         # lower cap on the annual quota (mt); 0 = none
+    quota_max::Float32         # upper cap on the annual quota (mt); <=0 = none
+    b_lim::Float32             # biomass (mt) at/below which the quota ramps to 0 (HCR); 0 = no ramp
+    b_thr::Float32             # biomass (mt) at/above which the full rate applies (HCR); 0 = no ramp
     season::Tuple{Int, Int}
     area::Tuple{Tuple{Float32, Float32}, Tuple{Float32, Float32}, Tuple{Float32, Float32}}
     slot_limit::Tuple{Float32, Float32}
@@ -55,6 +87,8 @@ mutable struct Fishery
     mean_weight_catch::Float64
     bycatch_tonnage::Float64
     bycatch_inds::Int
+    quota_base::Float32        # baseline annual quota (mt) from CSV; anchor for scaled mode
+    b_ref::Float32             # reference biomass (mt); 0 = capture current biomass on first update
 end
 
 # A flexible struct to hold any environmental data loaded from a NetCDF file
@@ -348,12 +382,12 @@ end
 
     if lower_bound < 1.0f-20 
         # If the lower bound is effectively zero, calculate CDF at the upper bound
-        z_upper = (CUDA.log(upper_bound) - μ) / σ
+        z_upper = (log(upper_bound) - μ) / σ
         return 0.5f0 * (1.0f0 + custom_erf(z_upper / sqrt2))
     else
         # Otherwise, calculate the difference between the two CDFs
-        z_lower = (CUDA.log(lower_bound) - μ) / σ
-        z_upper = (CUDA.log(upper_bound) - μ) / σ
+        z_lower = (log(lower_bound) - μ) / σ
+        z_upper = (log(upper_bound) - μ) / σ
         cdf_upper = 0.5f0 * (1.0f0 + custom_erf(z_upper / sqrt2))
         cdf_lower = 0.5f0 * (1.0f0 + custom_erf(z_lower / sqrt2))
         return cdf_upper - cdf_lower

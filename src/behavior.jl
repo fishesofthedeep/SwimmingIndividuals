@@ -112,9 +112,9 @@ function behavior(model::MarineModel, sp::Int64, ind::Vector{Int32}, outputs::Ma
 end
 
 function find_foraging_indices!(
-    time::CuArray{Float32},
-    gut_fullness::CuArray{Float32},
-    inds::CuArray{T}
+    time::AbstractVector,
+    gut_fullness::AbstractVector,
+    inds::AbstractVector{T}
 ) where {T <: Integer}
     still_forage_mask = (time .> 0f0) .& (gut_fullness .< 1)
     filtered_inds = inds[still_forage_mask]
@@ -145,21 +145,21 @@ function decision(model::MarineModel, sp::Int, ind::Vector{Int32}, outputs::Mari
     end
 
     # ---- Move relevant data to GPU once ----
-    ind_gpu = CuArray(Int32.(ind))
+    ind_gpu = array_type(arch)(Int32.(ind))
     n = length(ind_gpu)
 
-    gut_fullness_gpu = CuArray(Float32.(sp_dat.gut_fullness[ind]))
+    gut_fullness_gpu = array_type(arch)(Float32.(sp_dat.gut_fullness[ind]))
 
-    rand_vals = CUDA.rand(Float32, n)
+    rand_vals = array_type(arch)(rand(Float32, n))
     eat_mask_gpu = gut_fullness_gpu .<= rand_vals
     eating_gpu = ind_gpu[eat_mask_gpu]  # Initial foragers
 
     # Allocate a full-length time array on GPU (indexed by full predator index)
-    time_gpu = CUDA.fill(Float32(model.dt * 60.0), length(sp_dat.alive))
+    time_gpu = array_type(arch)(fill(Float32(model.dt * 60.0), length(sp_dat.alive)))
 
     # -------- Foraging Loop --------
     num_foraging_attempts = model.foraging_attempts
-    print("eat | ")
+    vprint("eat | ")
 
     for i in 1:num_foraging_attempts
         if isempty(eating_gpu); break; end
@@ -179,7 +179,7 @@ function decision(model::MarineModel, sp::Int, ind::Vector{Int32}, outputs::Mari
         ## Debugging if necessary. Mainly for me.
 
         # Filter: Keep only individuals who ate something
-        ration_vals = CuArray(Float32.(sp_dat.successful_ration[eating]))
+        ration_vals = array_type(arch)(Float32.(sp_dat.successful_ration[eating]))
         nonzero_mask = ration_vals .> 0f0
         eating_gpu = eating_gpu[nonzero_mask]
 
@@ -187,8 +187,8 @@ function decision(model::MarineModel, sp::Int, ind::Vector{Int32}, outputs::Mari
         isempty(eating_gpu) && break
 
         # Recalculate who should continue foraging
-        gut_fullness_now = CuArray(Float32.(sp_dat.gut_fullness[Array(eating_gpu)]))
-        time_now = CuArray(Float32.(time_gpu[Array(eating_gpu)]))
+        gut_fullness_now = array_type(arch)(Float32.(sp_dat.gut_fullness[Array(eating_gpu)]))
+        time_now = array_type(arch)(Float32.(time_gpu[Array(eating_gpu)]))
 
         eating_gpu = find_foraging_indices!(
             time_now, gut_fullness_now, eating_gpu

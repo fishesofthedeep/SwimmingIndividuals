@@ -102,7 +102,17 @@ function initialize_individuals(arch, plank, B::Float32, sp::Int, depths::Marine
             cpu_unique_ids[i] = (Int64(species_counter) * 100000000) + (Int64(sp) * 1000000) + Int64(date_int)
         end
         
-        land_mask = coalesce.(Array(envi.data["bathymetry"]), 0.0) .> 0
+        # Land mask for placement. Historically read from envi.data["bathymetry"];
+        # it is optional now (initial_ind_placement actually keys placement off
+        # capacity>0, which already excludes land because the driver layers are
+        # NODATA/NaN there). If a "bathymetry" layer is present (e.g. a static
+        # bathymetry.asc loaded via the env XML) it is used; otherwise we default to
+        # an all-water mask so a missing layer never aborts the run.
+        if haskey(envi.data, "bathymetry")
+            land_mask = coalesce.(Array(envi.data["bathymetry"]), 0.0) .> 0
+        else
+            land_mask = falses(size(capacities, 1), size(capacities, 2))
+        end
         res = initial_ind_placement(Array(capacities), sp, grid, n_agents, 1, land_mask)
         
         cpu_x, cpu_y, cpu_pool_x, cpu_pool_y = res.lons, res.lats, res.grid_x, res.grid_y
@@ -135,7 +145,8 @@ function initialize_individuals(arch, plank, B::Float32, sp::Int, depths::Marine
         @views plank.data.alive[1:n_agents] .= 1.0
         @views plank.data.generation[1:n_agents] .= 1
         @views plank.data.energy[1:n_agents] .= plank.data.biomass_ind[1:n_agents] .* plank.data.abundance[1:n_agents] .* plank.p.Energy_density[2][sp] .* 0.2
-        @views plank.data.gut_fullness[1:n_agents] .= CUDA.rand(Float32, n_agents)
+        # Portable RNG: draw on the host and copy to the device (works on CPU/GPU).
+        copyto!(plank.data.gut_fullness, 1, rand(Float32, n_agents), 1, n_agents)
         @views plank.data.age[1:n_agents] .= plank.p.Larval_Duration[2][sp]+1
         
         # Set remaining unused slots to non-alive
@@ -297,7 +308,7 @@ function resource_growth!(model::MarineModel, current_date)
     # --- 1. Get the seasonal multipliers for the current month ---
     # PERFORMANCE NOTE: CSV.read is extremely slow to do every timestep. 
     # Consider loading this into model.files or model.environment during setup_and_run_model!
-    seasonality_df = CSV.read(model.files[model.files.File .== "growth_seasonality", :Destination][1], DataFrame)
+    seasonality_df = cached_csv_for(model.files, "growth_seasonality")
     
     # Get the multipliers for the current month
     current_month_name = Dates.monthname(current_date)
@@ -314,19 +325,38 @@ function resource_growth!(model::MarineModel, current_date)
     minutes_per_year = 365.0f0 * 1440.0f0
     per_timestep_rates = array_type(arch)(Float32.(adjusted_annual_rates ./ (minutes_per_year / model.dt)))
 
+    # --- 2b. Primary-production multiplier on carrying capacity K --------------
+    # When time-varying ASC forcing is active and an `npp` (LayerRelPP) variable is
+    # present, scale each cell's carrying capacity by the normalised NPP ratio for
+    # the current month. Productivity sets the standing stock a cell can support, so
+    # NPP multiplies K (not the intrinsic rate r); a ratio of 1 reproduces the
+    # trait-table baseline. If no ASC/NPP forcing is active this is a no-op (the
+    # kernel receives an all-ones map) and behaviour is identical to before.
+    lonres, latres = size(model.resources.biomass, 1), size(model.resources.biomass, 2)
+    npp_mult_cpu = current_npp_multiplier(model, current_date)   # lon×lat or nothing
+    if npp_mult_cpu === nothing
+        npp_mult = array_type(arch)(ones(Float32, lonres, latres))
+    else
+        npp_mult = array_type(arch)(Float32.(npp_mult_cpu))
+    end
+
     # --- 3. Launch the kernel ---
     kernel! = resource_growth_kernel!(device(arch), (8, 8, 4, 1), size(model.resources.biomass))
-    kernel!(model.resources.biomass, model.resources.capacity, per_timestep_rates)
+    kernel!(model.resources.biomass, model.resources.capacity, per_timestep_rates, npp_mult)
     KernelAbstractions.synchronize(device(arch))
 end
 
-# Kernel for resource growth
-@kernel function resource_growth_kernel!(biomass_grid, capacity_grid, per_timestep_rates)
+# Kernel for resource growth.
+# `npp_mult` is a (lon,lat) multiplier applied to the carrying capacity K, so the
+# logistic attractor itself tracks productivity in space and time.
+@kernel function resource_growth_kernel!(biomass_grid, capacity_grid, per_timestep_rates, npp_mult)
     lon, lat, depth, sp = @index(Global, NTuple)
     
     @inbounds biomass = biomass_grid[lon, lat, depth, sp]
-    @inbounds capacity = capacity_grid[lon, lat, depth, sp]
+    @inbounds base_capacity = capacity_grid[lon, lat, depth, sp]
     @inbounds rate = per_timestep_rates[sp]
+    @inbounds m = npp_mult[lon, lat]
+    capacity = base_capacity * (isfinite(m) ? m : 1.0f0)
 
     if capacity > 0.0f0
         if biomass > 1f-9
@@ -343,9 +373,12 @@ end
 # ===================================================================
 # Reproduction System
 # ===================================================================
-function calculate_new_offspring_cpu(p_cpu, parent_data, repro_energy_list, spawn_val, sp, current_date::Date, daily_births::Int)
-    # --- PRE-FLIGHT CHECK: Validate initial parent biomass before any calculations ---
-    # This ensures we don't use parents with invalid biomass for reproduction calculations.
+function calculate_new_offspring_cpu(p_cpu, parent_data, repro_energy_list, spawn_val, sp, current_date::Date, daily_births::Int;
+                                     parent_temp::AbstractVector=Float32[],
+                                     local_spawner_biomass::AbstractVector=Float32[],
+                                     T_opt::Float64=NaN, T_sd::Float64=NaN,
+                                     dd_beta::Float64=0.0, sigma_R::Float64=0.0,
+                                     rng=Random.default_rng())
     for i in 1:length(parent_data.biomass_ind)
         if !isfinite(parent_data.biomass_ind[i]) || parent_data.biomass_ind[i] <= 0.0f0
             @warn """
@@ -366,7 +399,65 @@ function calculate_new_offspring_cpu(p_cpu, parent_data, repro_energy_list, spaw
     
     num_eggs_per_parent_float = spent_energy ./ (egg_energy .+ 1.0f-9) .* sex_ratio .* hatch_survival
 
-    # --- DIAGNOSTIC CHECK 1: Validate the result of the egg calculation ---
+    # ===================================================================
+    # Environmentally-driven, density-dependent, and stochastic recruitment.
+    # ===================================================================
+    # The base calculation above is the deterministic egg-energy budget. We now
+    # convert egg production into *realised* recruits by multiplying through three
+    # survival/process terms, each of which is a no-op under its default so the
+    # original behaviour is recovered when recruitment parameters are absent.
+    #
+    #  (1) TEMPERATURE-DEPENDENT EARLY-LIFE SURVIVAL (environmental driver).
+    #      A Gaussian thermal window for egg/larval survival centred on T_opt with
+    #      width T_sd, evaluated at each parent's ambient temperature. This is the
+    #      standard "thermal performance / spawning-habitat suitability" form used
+    #      for recruitment in temperature-driven fish models (e.g. Pörtner & Peck
+    #      2010 J. Fish Biol.; Hare et al. 2010 for SST-recruitment links; SEDAR
+    #      King Mackerel work links recruitment to spring/summer SST). For King
+    #      Mackerel a spawning/larval optimum near 26-28 C is appropriate.
+    #
+    #  (2) DENSITY-DEPENDENT COMPENSATION (emergent Beverton-Holt).
+    #      Early-life survival declines with LOCAL conspecific spawner biomass as
+    #      1/(1 + dd_beta * local_spawner_biomass). Because egg production is ~linear
+    #      in spawner energy (≈ proportional to local SSB) while per-egg survival
+    #      falls as local SSB rises, the realised recruits-vs-SSB curve saturates:
+    #      this *is* Beverton-Holt compensation, but it EMERGES from local crowding
+    #      rather than being imposed as a stock-level function (Beverton & Holt 1957;
+    #      the local-density formulation follows the spatial/IBM compensation logic
+    #      in e.g. Rose et al. 2001 and the "emergent density dependence" discussion
+    #      in DeAngelis & Grimm 2014). dd_beta=0 disables it.
+    #
+    #  (3) RECRUITMENT PROCESS ERROR (interannual variability).
+    #      A single lognormal deviation per spawning event, exp(sigma_R*z - sigma_R^2/2)
+    #      with z~N(0,1), bias-corrected to mean 1. This is the standard
+    #      log-normal recruitment deviation of stock-assessment practice (Methot &
+    #      Wetzel 2013, Stock Synthesis; Thorson et al. 2014 on sigma_R), and is the
+    #      single highest-leverage change for producing realistic dynamic SSB/recruit
+    #      trends. sigma_R=0 disables it.
+    n_parents = length(num_eggs_per_parent_float)
+
+    # (3) one cohort-level deviation, shared across this spawning event
+    rec_dev = sigma_R > 0.0 ? Float32(exp(sigma_R * randn(rng) - 0.5 * sigma_R^2)) : 1.0f0
+
+    @inbounds for i in 1:n_parents
+        surv = 1.0f0
+        # (1) thermal survival
+        if isfinite(T_opt) && isfinite(T_sd) && T_sd > 0 && i <= length(parent_temp)
+            Ti = parent_temp[i]
+            if isfinite(Ti)
+                surv *= Float32(exp(-0.5 * ((Ti - T_opt) / T_sd)^2))
+            end
+        end
+        # (2) local density-dependent survival
+        if dd_beta > 0.0 && i <= length(local_spawner_biomass)
+            sb = local_spawner_biomass[i]
+            if isfinite(sb) && sb > 0
+                surv *= Float32(1.0 / (1.0 + dd_beta * sb))
+            end
+        end
+        num_eggs_per_parent_float[i] *= surv * rec_dev
+    end
+
     if any(!isfinite, num_eggs_per_parent_float)
         invalid_indices = findall(!isfinite, num_eggs_per_parent_float)
         @warn """
@@ -408,7 +499,6 @@ function calculate_new_offspring_cpu(p_cpu, parent_data, repro_energy_list, spaw
 
     # --- 6. Loop through each PRODUCING PARENT to create one new agent ---
     for (i, parent_idx) in enumerate(parent_indices)
-        # --- DIAGNOSTIC CHECK 2: Validate Parent Coordinates before inheritance ---
         px, py, pz = parent_data.x[parent_idx], parent_data.y[parent_idx], parent_data.z[parent_idx]
         if !isfinite(px) || !isfinite(py) || !isfinite(pz)
             @warn """
@@ -459,7 +549,6 @@ function calculate_new_offspring_cpu(p_cpu, parent_data, repro_energy_list, spaw
 
     daily_births += total_new_agents
 
-    # --- DIAGNOSTIC CHECK 3: Final validation of all new agent data before return ---
     if any(!isfinite, new_biomass_school) || any(!isfinite, new_energy)
         @error """
         FATAL DIAGNOSTIC: Attempting to return new agents with invalid biomass or energy!

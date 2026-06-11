@@ -23,14 +23,26 @@ function generate_outputs(model::MarineModel, n_bins::Int32)
     
     consumption = array_type(arch)(zeros(Float32, lonres, latres, depthres, n_total_species, n_total_species, n_bins, n_bins))
     
-    # Mortalities track predation ON agents
-    Smort = array_type(arch)(zeros(Int32, lonres, latres, depthres, model.n_species, n_bins))
+    # Mortalities track predation ON agents.
+    # NOTE: these accumulate *biomass* (Float32 grams) during a step; they are
+    # converted to instantaneous rates at output time. They MUST be Float32 to
+    # match the MarineOutputs struct and to avoid truncating fractional grams.
+    Smort = array_type(arch)(zeros(Float32, lonres, latres, depthres, model.n_species, n_bins))
 
-    # Fishing mortality is ON agents FROM fisheries
-    Fmort = array_type(arch)(zeros(Int32, lonres, latres, depthres, n_fish, model.n_species, n_bins))
+    # Predation mortality ON agents (biomass g) and "other" mortality (senescence
+    # and any non-starvation/non-predation/non-fishing death). Same shape as Smort.
+    Pmort = array_type(arch)(zeros(Float32, lonres, latres, depthres, model.n_species, n_bins))
+    Omort = array_type(arch)(zeros(Float32, lonres, latres, depthres, model.n_species, n_bins))
+
+    # Fishing mortality is ON agents FROM fisheries (biomass caught, Float32 g)
+    Fmort = array_type(arch)(zeros(Float32, lonres, latres, depthres, n_fish, model.n_species, n_bins))
     
     abundance = array_type(arch)(zeros(Float32, lonres, latres, depthres, n_total_species,n_bins))
     biomass = array_type(arch)(zeros(Float32, lonres, latres, depthres, n_total_species,n_bins))
+    # Standing biomass-by-size at the start of the current output interval; used as
+    # the denominator when converting accumulated kill-biomass into instantaneous
+    # rates, so F/S/P are deaths-over-interval / population-at-start-of-interval.
+    biomass_ref = array_type(arch)(zeros(Float32, lonres, latres, depthres, n_total_species,n_bins))
 
-    return MarineOutputs(Fmort,Smort, consumption, abundance,biomass)
+    return MarineOutputs(Fmort, Smort, Pmort, Omort, consumption, abundance, biomass, biomass_ref)
 end

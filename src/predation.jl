@@ -9,9 +9,11 @@
     dlat = lat2_rad - lat1_rad
     dlon = lon2_rad - lon1_rad
     
-    # Haversine formula for horizontal distance
-    a = CUDA.sin(dlat / 2f0)^2 + CUDA.cos(lat1_rad) * CUDA.cos(lat2_rad) * CUDA.sin(dlon / 2f0)^2
-    c = 2f0 * CUDA.atan(CUDA.sqrt(a), CUDA.sqrt(1f0 - a))
+    # Haversine formula for horizontal distance. Plain trig intrinsics are
+    # lowered to the correct device functions by KernelAbstractions on any
+    # backend (CUDA/ROCm/CPU); the previous CUDA.* calls hard-locked this to NVIDIA.
+    a = sin(dlat / 2f0)^2 + cos(lat1_rad) * cos(lat2_rad) * sin(dlon / 2f0)^2
+    c = 2f0 * atan(sqrt(a), sqrt(1f0 - a))
     horizontal_dist = R * c
 
     # Vertical distance
@@ -46,40 +48,41 @@ function build_spatial_index!(model::MarineModel)
 
         kernel_assign = assign_cell_ids_kernel!(device(arch), 256, (n_agents,))
         kernel_assign(agents, lonres, latres)
-        
-        sortperm!(agents.sorted_id, agents.cell_id)
-        
-        if arch isa GPU
-            sorted_cell_ids = agents.cell_id[agents.sorted_id]
-            cell_range = array_type(arch)(1:n_cells)
-            cell_starts_gpu = thrust.searchsortedfirst(sorted_cell_ids, cell_range)
-            
-            cell_ends_gpu = similar(cell_starts_gpu)
-            if n_cells > 1
-                cell_ends_gpu[1:end-1] .= cell_starts_gpu[2:end] .- 1
-            end
-            cell_ends_gpu[end] = n_agents
-            
-            copyto!(@view(agents.cell_starts[1:n_cells]), cell_starts_gpu)
-            copyto!(@view(agents.cell_ends[1:n_cells]), cell_ends_gpu)
-        else
-            sorted_cell_ids_cpu = agents.cell_id[agents.sorted_id]
-            cell_starts_cpu = ones(Int, n_cells)
-            cell_ends_cpu = zeros(Int, n_cells)
-            
-            if !isempty(sorted_cell_ids_cpu)
-                for i in 2:n_agents
-                    if sorted_cell_ids_cpu[i] != sorted_cell_ids_cpu[i-1]
-                        cell_starts_cpu[sorted_cell_ids_cpu[i]] = i
-                        cell_ends_cpu[sorted_cell_ids_cpu[i-1]] = i - 1
+        KernelAbstractions.synchronize(device(arch))
+
+        # Build the cell -> agent-range index on the host. This is cheap (a
+        # single Int array per species, not the full StructArray) and is
+        # portable across all backends, unlike the previous GPU branch which
+        # referenced an undefined `thrust.searchsortedfirst`.
+        # Convention: cell_starts[c] == 0 marks an empty cell.
+        cell_id_cpu = Array(@view agents.cell_id[1:n_agents])
+        order = sortperm(cell_id_cpu)
+        sorted_cell_ids = cell_id_cpu[order]
+
+        cell_starts_cpu = zeros(eltype(agents.cell_starts), n_cells)
+        cell_ends_cpu   = zeros(eltype(agents.cell_ends),   n_cells)
+        if n_agents > 0
+            run_start = 1
+            @inbounds for i in 2:n_agents
+                if sorted_cell_ids[i] != sorted_cell_ids[i-1]
+                    c = sorted_cell_ids[i-1]
+                    if 1 <= c <= n_cells
+                        cell_starts_cpu[c] = run_start
+                        cell_ends_cpu[c]   = i - 1
                     end
+                    run_start = i
                 end
-                cell_ends_cpu[sorted_cell_ids_cpu[end]] = n_agents
             end
-            
-            copyto!(@view(agents.cell_starts[1:n_cells]), cell_starts_cpu)
-            copyto!(@view(agents.cell_ends[1:n_cells]), cell_ends_cpu)
+            c_last = sorted_cell_ids[n_agents]
+            if 1 <= c_last <= n_cells
+                cell_starts_cpu[c_last] = run_start
+                cell_ends_cpu[c_last]   = n_agents
+            end
         end
+
+        copyto!(@view(agents.sorted_id[1:n_agents]), eltype(agents.sorted_id).(order))
+        copyto!(@view(agents.cell_starts[1:n_cells]), cell_starts_cpu)
+        copyto!(@view(agents.cell_ends[1:n_cells]), cell_ends_cpu)
     end
 end
 
@@ -110,22 +113,31 @@ end
             search_z = my_pool_z
 
             if 1 <= search_x <= grid_params.lonres && 1 <= search_y <= grid_params.latres && 1 <= search_z <= grid_params.depthres
-                # Search Focal Species Prey
+                # Search Focal Species Prey using the spatial cell index:
+                # only agents whose cell is this neighbor cell are scanned,
+                # instead of brute-forcing every agent of every species.
                 for prey_sp_idx in 1:length(prey_data_all)
                     prey_data = prey_data_all[prey_sp_idx]
-                    # This simplified search iterates over all prey. A full spatial index implementation would be faster.
-                    for k in 1:length(prey_data.x)
-                        @inbounds if prey_data.alive[k] == 1.0 && min_size <= prey_data.length[k] <= max_size
-                            
-                            prey_x, prey_y, prey_z = prey_data.x[k], prey_data.y[k], prey_data.z[k]
-                            dist_sq = haversine_distance_sq(my_y, my_x, my_z, prey_y, prey_x, prey_z)
+                    cell = get_cell_id(search_x, search_y, search_z, grid_params.lonres, grid_params.latres)
+                    n_cells_sp = length(prey_data.cell_starts)
+                    if 1 <= cell <= n_cells_sp
+                        c_start = prey_data.cell_starts[cell]
+                        c_end   = prey_data.cell_ends[cell]
+                        if c_start > 0   # 0 marks an empty cell
+                            for kk in c_start:c_end
+                                k = prey_data.sorted_id[kk]
+                                @inbounds if prey_data.alive[k] == 1.0 && min_size <= prey_data.length[k] <= max_size
 
-                            if dist_sq <= detection_radius_sq && dist_sq < best_prey_dist[pred_idx]
-                                old_dist = atomic_cas!(pointer(best_prey_dist, pred_idx), best_prey_dist[pred_idx], Float32(dist_sq))
-                                if old_dist > dist_sq # Check if our update was successful
-                                    best_prey_idx[pred_idx] = k
-                                    best_prey_sp[pred_idx] = prey_sp_idx
-                                    best_prey_type[pred_idx] = 1
+                                    prey_x, prey_y, prey_z = prey_data.x[k], prey_data.y[k], prey_data.z[k]
+                                    dist_sq = haversine_distance_sq(my_y, my_x, my_z, prey_y, prey_x, prey_z)
+
+                                    # One thread owns this pred_idx, so no atomic is needed.
+                                    if dist_sq <= detection_radius_sq && dist_sq < best_prey_dist[pred_idx]
+                                        best_prey_dist[pred_idx] = Float32(dist_sq)
+                                        best_prey_idx[pred_idx]  = k
+                                        best_prey_sp[pred_idx]   = prey_sp_idx
+                                        best_prey_type[pred_idx] = 1
+                                    end
                                 end
                             end
                         end
@@ -163,13 +175,10 @@ end
 
                                         if dist_sq < best_prey_dist[pred_idx]
                                             linear_idx = search_x + (search_y-1)*grid_params.lonres + (search_z-1)*grid_params.lonres*grid_params.latres
-                                            old_dist = atomic_cas!(pointer(best_prey_dist, pred_idx), best_prey_dist[pred_idx], Float32(dist_sq))
-                                            
-                                            if old_dist > dist_sq
-                                                best_prey_idx[pred_idx] = linear_idx
-                                                best_prey_sp[pred_idx] = res_sp
-                                                best_prey_type[pred_idx] = 2
-                                            end
+                                            best_prey_dist[pred_idx] = Float32(dist_sq)
+                                            best_prey_idx[pred_idx]  = linear_idx
+                                            best_prey_sp[pred_idx]   = res_sp
+                                            best_prey_type[pred_idx] = 2
                                         end
                                     end
                                 end
@@ -293,6 +302,7 @@ end
     resource_energy_density,
     resource_trait,
     consumption_array,
+    Pmort,
     size_bin_thresholds,
     swim_velo::Float32, handling_time::Float32, time_array,
     predator_sp_idx::Int, n_species::Int32,
@@ -417,6 +427,14 @@ end
                             if all_prey_abundance[prey_sp_idx][prey_idx] <= 0
                                 all_prey_alive[prey_sp_idx][prey_idx] = 0.0f0
                             end
+
+                            # Log predation mortality ON the agent prey (biomass g),
+                            # by prey species and prey size bin, at the predation cell.
+                            if (px > 0 && px <= size(Pmort,1) && py > 0 && py <= size(Pmort,2) &&
+                                pz > 0 && pz <= size(Pmort,3) &&
+                                prey_size_bin > 0 && prey_size_bin <= size(Pmort,5))
+                                @atomic Pmort[px, py, pz, prey_sp_idx, prey_size_bin] += effective_biomass
+                            end
                         else
                             @atomic resource_biomass_grid[px, py, pz, prey_sp_idx] -= effective_biomass
                         end
@@ -440,7 +458,7 @@ end
     end
 end
 
-function apply_consumption!(model::MarineModel, sp::Int, time::CuArray{Float32}, outputs::MarineOutputs)
+function apply_consumption!(model::MarineModel, sp::Int, time::AbstractArray, outputs::MarineOutputs)
     arch = model.arch
     pred_data = model.individuals.animals[sp].data
     n_species = model.n_species
@@ -495,6 +513,7 @@ function apply_consumption!(model::MarineModel, sp::Int, time::CuArray{Float32},
         resource_energy_density,
         res_trait_gpu,
         outputs.consumption,
+        outputs.Pmort,
         model.size_bin_thresholds,
         swim_velo, handling_time, time,
         sp, n_species,
@@ -566,15 +585,17 @@ end
     resource_biomass,
     animals_all::Tuple,
     consumption_array,
-    size_bin_thresholds::CuDeviceMatrix{Float32},
+    size_bin_thresholds,
     n_species::Int32,
     n_resources::Int32,
     n_thresholds::Int32,
-    resource_traits::CuDeviceMatrix{Float32},
+    resource_traits,
     agent_energy_densities,
     dt::Float32,
     cell_size_deg::Float32,
-    depth_res_m::Float32
+    depth_res_m::Float32,
+    lonres::Int32,
+    latres::Int32
 )
     x, y, z, r = @index(Global, NTuple)
 
@@ -602,12 +623,19 @@ end
                 
                 # Agent Survey
                 total_agent_energy::Float32 = 0.0f0
+                cell_idx_surv = get_cell_id(x, y, z, lonres, latres)
                 for sp in 1:n_species
                     agent_data = animals_all[sp]
-                    for i in 1:length(agent_data.x)
-                        if agent_data.pool_x[i] == x && agent_data.pool_y[i] == y && agent_data.pool_z[i] == z
-                            if agent_data.alive[i] == 1.0f0 && agent_data.length[i] >= min_prey_size && agent_data.length[i] <= max_prey_size
-                                total_agent_energy += agent_data.biomass_school[i] * agent_energy_densities[sp]
+                    n_cells_sp = length(agent_data.cell_starts)
+                    if 1 <= cell_idx_surv <= n_cells_sp
+                        c_start = agent_data.cell_starts[cell_idx_surv]
+                        c_end   = agent_data.cell_ends[cell_idx_surv]
+                        if c_start > 0
+                            for kk in c_start:c_end
+                                i = agent_data.sorted_id[kk]
+                                if agent_data.alive[i] == 1.0f0 && agent_data.length[i] >= min_prey_size && agent_data.length[i] <= max_prey_size
+                                    total_agent_energy += agent_data.biomass_school[i] * agent_energy_densities[sp]
+                                end
                             end
                         end
                     end
@@ -652,10 +680,17 @@ end
                             agent_data = animals_all[sp]
                             energy_density_sp = agent_energy_densities[sp]
                             total_suitable_biomass_sp::Float32 = 0.0f0
-                            for i in 1:length(agent_data.x)
-                                if agent_data.pool_x[i] == x && agent_data.pool_y[i] == y && agent_data.pool_z[i] == z
-                                    if agent_data.alive[i] == 1.0f0 && agent_data.length[i] >= min_prey_size && agent_data.length[i] <= max_prey_size
-                                        total_suitable_biomass_sp += agent_data.biomass_school[i]
+                            cell_idx_cons = get_cell_id(x, y, z, lonres, latres)
+                            n_cells_sp2 = length(agent_data.cell_starts)
+                            if 1 <= cell_idx_cons <= n_cells_sp2
+                                c_start2 = agent_data.cell_starts[cell_idx_cons]
+                                c_end2   = agent_data.cell_ends[cell_idx_cons]
+                                if c_start2 > 0
+                                    for kk in c_start2:c_end2
+                                        i = agent_data.sorted_id[kk]
+                                        if agent_data.alive[i] == 1.0f0 && agent_data.length[i] >= min_prey_size && agent_data.length[i] <= max_prey_size
+                                            total_suitable_biomass_sp += agent_data.biomass_school[i]
+                                        end
                                     end
                                 end
                             end
@@ -719,7 +754,8 @@ end
     animal_data,
     agent_biomass_eaten_grid,
     consumption_array,
-    size_bin_thresholds::CuDeviceMatrix{Float32},
+    Pmort,
+    size_bin_thresholds,
     sp_idx::Int32,
     n_species::Int32
 )
@@ -757,6 +793,12 @@ end
                             @atomic animal_data.energy[i] -= energy_removed
                             @atomic animal_data.biomass_school[i] -= actual_biomass_removed
                             @atomic animal_data.abundance[i] -= Float32(inds_removed)
+                        end
+
+                        # Log predation mortality ON this prey (biomass g) by size bin.
+                        prey_bin_P = find_species_size_bin(animal_data.length[i], sp_idx, size_bin_thresholds)
+                        if prey_bin_P > 0 && prey_bin_P <= size(Pmort, 5)
+                            @atomic Pmort[x, y, z, sp_idx, prey_bin_P] += actual_biomass_removed
                         end
                         
                         for r in 1:size(agent_biomass_eaten_grid, 4)
@@ -799,6 +841,7 @@ end
 # --- 4. Driver Function ---
 function resource_predation!(model::MarineModel, output::MarineOutputs)
     arch = model.arch
+    build_spatial_index!(model)
     g = model.depths.grid
     lonres = Int(g[g.Name .== "lonres", :Value][1])
     latres = Int(g[g.Name .== "latres", :Value][1])
@@ -851,7 +894,9 @@ function resource_predation!(model::MarineModel, output::MarineOutputs)
         agent_energy_densities_gpu,
         Float32(model.dt),
         grid_params.cell_size_deg,
-        grid_params.depth_res_m
+        grid_params.depth_res_m,
+        Int32(lonres),
+        Int32(latres)
     )
 
     # Call Kernel 2 for each species
@@ -863,6 +908,7 @@ function resource_predation!(model::MarineModel, output::MarineOutputs)
                 agents, 
                 agent_biomass_eaten_grid, 
                 output.consumption,
+                output.Pmort,
                 size_bin_thresholds,
                 Int32(sp_idx),
                 Int32(n_sp)

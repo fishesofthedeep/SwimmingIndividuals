@@ -10,7 +10,10 @@ main entry point in your `model.jl` script.
 """
 function runSI(sim::MarineSimulation)
     println("✅ Model Initialized. Starting simulation run...")
-    for i in 1:sim.iterations
+    if sim.model.iteration > 0
+        println("   Resuming from iteration $(sim.model.iteration).")
+    end
+    while sim.model.iteration < sim.iterations
         TimeStep!(sim)
     end
     println("✅ Simulation run complete.")

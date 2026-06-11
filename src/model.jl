@@ -2,6 +2,13 @@
 # High-Level Model Setup and Execution
 # ===================================================================
 
+# Look up an optional row in the params table; return `default` if absent.
+function _opt_param(params::DataFrame, name::AbstractString, default)
+    idx = findfirst(==(name), params.Name)
+    idx === nothing && return default
+    return params[idx, :Value]
+end
+
 """
     setup_and_run_model(config_filename="files.csv")
 
@@ -43,7 +50,10 @@ function setup_and_run_model(config_filename="files.csv")
     params = CSV.read(files[files.File .== "params", :Destination][1], DataFrame)
     grid = CSV.read(files[files.File .== "grid", :Destination][1], DataFrame)
     fisheries_df = CSV.read(files[files.File .== "fisheries", :Destination][1], DataFrame)
-    envi_file = files[files.File .== "environment", :Destination][1]
+    # NetCDF environment file is OPTIONAL now: only needed when ASC forcing
+    # (env_xml) is not configured. Look it up safely so a missing row / file does
+    # not error when running purely from the .asc XML.
+    envi_file = any(files.File .== "environment") ? files[files.File .== "environment", :Destination][1] : ""
 
     ## 2. Global simulation settings
     Nsp = parse(Int32, params[params.Name .== "numspec", :Value][1])
@@ -56,9 +66,34 @@ function setup_and_run_model(config_filename="files.csv")
     dt = parse(Int32, params[params.Name .== "model_dt", :Value][1])
     n_iters = parse(Int16, params[params.Name .== "n_iter", :Value][1])
     
-    maxN = Int64(500000) 
+    # maxN is now configurable (param "maxN"); falls back to the historical default.
+    maxN = Int64(parse(Int, string(_opt_param(params, "maxN", "500000"))))
     arch_str = params[params.Name .== "architecture", :Value][1]
     output_dt = Int32(max(1, round(output_dt_minutes / dt)))
+
+    # --- Optional run controls (all default to previous behaviour if absent) ---
+    # Reproducibility: seed host (and device) RNGs when a seed is provided.
+    seed_val = _opt_param(params, "seed", "")
+    if seed_val !== "" && seed_val !== missing && string(seed_val) != ""
+        s = parse(Int, string(seed_val))
+        Random.seed!(s)
+        try
+            CUDA.functional() && CUDA.seed!(s)
+        catch err
+            @warn "Could not seed CUDA RNG: $err"
+        end
+        @info "RNG seeded with $s for reproducibility."
+    end
+
+    # Performance/IO cadences (see RUNTIME_CONFIG in timestep.jl).
+    RUNTIME_CONFIG[:merge_every]      = Int(parse(Int, string(_opt_param(params, "merge_every", "1"))))
+    RUNTIME_CONFIG[:checkpoint_every] = Int(parse(Int, string(_opt_param(params, "checkpoint_every", "0"))))
+    restart_requested = string(_opt_param(params, "restart", "0")) in ("1", "true", "TRUE")
+
+    # Headless plotting backend for servers (no display). Only relevant if diagnostics on.
+    if plt_diags > 0
+        ENV["GKSwstype"] = "100"
+    end
 
     # Handle Hardware Architecture
     if arch_str == "GPU"
@@ -74,12 +109,39 @@ function setup_and_run_model(config_filename="files.csv")
         @info "✅ Architecture successfully set to CPU."
     end
 
-    start_date = Date(2023, 1, 1) # Placeholder start date
+    # --- Model start date (configurable via params.csv) ------------------------
+    # `start_year` is the post-spinup "real" calendar year the simulation begins;
+    # `start_month`/`start_day` are optional (default Jan 1). This date drives both
+    # the calendar in TimeStep! (via MODEL_START_DATETIME) and initial agent
+    # placement. Absent -> defaults to 2026-01-01 so older configs are unchanged.
+    start_year  = Int(parse(Int, string(_opt_param(params, "start_year",  "2026"))))
+    start_month = Int(parse(Int, string(_opt_param(params, "start_month", "1"))))
+    start_day   = Int(parse(Int, string(_opt_param(params, "start_day",   "1"))))
+    start_date  = Date(start_year, start_month, start_day)
+    MODEL_START_DATETIME[] = DateTime(start_date)
+    @info "Model start date set to $start_date (post-spinup)."
 
     ## 3. Environment and Infrastructure Initialization
-    envi = generate_environment!(arch, envi_file, plt_diags, files)
     depths = generate_depths(files)
-    capacities = initial_habitat_capacity(envi, Nsp, Nresource, files, arch, plt_diags)
+
+    # Environment source: time-varying ESRI .asc forcing from STConfig.xml when a
+    # files.csv row File == "env_xml" is present (NetCDF is then NOT used at all),
+    # otherwise the legacy NetCDF environment.nc path. The .asc path builds the
+    # initial environment + habitat capacities directly from the rasters; from the
+    # first timestep on, update_environment_from_asc! refreshes them each month.
+    ENV_FORCING[] = nothing
+    if any(files.File .== "env_xml")
+        xml_path = files[files.File .== "env_xml", :Destination][1]
+        base_dir = any(files.File .== "env_dir") ? files[files.File .== "env_dir", :Destination][1] : ""
+        isfile(xml_path) || error("env_xml row present but file not found at: $xml_path")
+        ENV_FORCING[] = load_env_forcing(xml_path, grid; base_dir=base_dir)
+        @info "Environment source: time-varying ASC forcing from $xml_path (NetCDF disabled)."
+        envi, capacities = bootstrap_environment_from_asc(ENV_FORCING[], files, grid, arch,
+                                                          start_date, Nsp, Nresource, plt_diags)
+    else
+        envi = generate_environment!(arch, envi_file, plt_diags, files)
+        capacities = initial_habitat_capacity(envi, Nsp, Nresource, files, arch, plt_diags)
+    end
 
     ## 4. Multi-Run Simulation Loop
     for iter in 1:n_iters
@@ -100,18 +162,13 @@ function setup_and_run_model(config_filename="files.csv")
             bioms[sp] = sum(inds.animals[sp].data.biomass_school)
         end
 
-        # FIXED: Generate Size Bin Thresholds for mortality/outputs
+        # Generate size-bin thresholds for mortality/outputs.
+        # Uses create_size_bin_matrix (utilities.jl): returns an (n_bins+1) x
+        # n_total_species matrix of log-spaced thresholds covering BOTH the focal
+        # species and the resource groups, matching what find_species_size_bin
+        # expects. (Replaces the older focal-only (Nsp, n_bins) form.)
         n_bins = Int32(10)
-        size_bins_cpu = zeros(Float32, Nsp, n_bins)
-        for sp in 1:Nsp
-            min_s = Float32(trait[:Min_Size][sp])
-            max_s = Float32(trait[:Max_Size][sp])
-            step = (max_s - min_s) / n_bins
-            for b in 1:n_bins
-                size_bins_cpu[sp, b] = min_s + step * b
-            end
-        end
-        size_bin_thresholds = array_type(arch)(size_bins_cpu)
+        size_bin_thresholds = create_size_bin_matrix(trait, resource_trait, n_bins, arch)
 
         # Create the high-level model object
         # FIXED: Explicitly cast variables to strict Float32/Int32 to match constructor exactly
@@ -126,8 +183,23 @@ function setup_and_run_model(config_filename="files.csv")
         # Setup outputs
         outputs = generate_outputs(model, n_bins)
 
+        # Initialise biomass-linked quotas for the first year (mode-2 fisheries);
+        # thereafter they are recomputed each Jan 1 in TimeStep!.
+        update_dynamic_quotas!(model)
+
         # Setup and Run Simulation
         sim = MarineSimulation(model, dt, n_iteration, iter, outputs)
+
+        # Resume from a checkpoint if requested and one exists for this run.
+        if restart_requested
+            ckpt = joinpath(full_res_path, "Checkpoint", "checkpoint_run$(iter).jls")
+            if isfile(ckpt)
+                load_checkpoint!(sim, ckpt)
+            else
+                @info "Restart requested but no checkpoint found for run $iter; starting fresh."
+            end
+        end
+
         runSI(sim)
     end
     

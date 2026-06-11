@@ -5,6 +5,18 @@ The primary orchestration loop for a single model iteration.
 Handles calendar progression, environment updates, agent biology, and I/O.
 Includes the application of instantaneous natural mortality and school consolidation.
 """
+
+# Runtime cadence configuration, set in `setup_and_run_model`. Kept as a small
+# mutable global so the MarineModel struct layout does not have to change.
+#   merge_every      : run agent consolidation every N steps (1 = every step)
+#   checkpoint_every : write a restart checkpoint every N steps (0 = never)
+const RUNTIME_CONFIG = Dict{Symbol, Int}(:merge_every => 1, :checkpoint_every => 0)
+
+# Post-spinup "real" calendar start, configurable via params.csv (start_year /
+# optional start_month, start_day). Set in setup_and_run_model; defaults to
+# 2026-01-01 if those params are absent so existing configs are unchanged.
+const MODEL_START_DATETIME = Ref{DateTime}(DateTime(2026, 1, 1, 0, 0))
+
 function TimeStep!(sim::MarineSimulation)
     model = sim.model
     envi = model.environment
@@ -17,9 +29,14 @@ function TimeStep!(sim::MarineSimulation)
     model.iteration += 1
     model.t = (model.t + sim.ΔT) % 1440 
 
+    # Rebuild the spatial cell index so the prey-search kernel can scan only
+    # the agents in each neighbour cell rather than brute-forcing all prey.
+    build_spatial_index!(model)
+
+
     # --- 1. Calendar & Date Resolution ---
-    # Target start date (post-spinup) is Jan 1, 2026.
-    target_start_date = DateTime(2026, 1, 1, 0, 0)
+    # Post-spinup "real" calendar start (set from params.csv start_year in setup).
+    target_start_date = MODEL_START_DATETIME[]
     
     elapsed_minutes = (model.iteration - 1) * sim.ΔT
     current_datetime = target_start_date + Minute(round(Int, elapsed_minutes - model.spinup))
@@ -34,9 +51,21 @@ function TimeStep!(sim::MarineSimulation)
     day_index = dayofyear(current_date)
 
     # --- 2. Environmental Dynamics ---
-    if month_index != envi.ts
+    month_changed = (month_index != envi.ts)
+    if month_changed
         move_resources!(model, month_index)
         envi.ts = month_index
+    end
+    # If time-varying ASC forcing is active, refresh the driver/temperature layers
+    # and recompute the SST-driven habitat-capacity slice for this absolute month.
+    # Runs on the first iteration and on every month change; the layer cache makes
+    # within-month repeats cheap. No-op when ENV_FORCING is unset (NetCDF path).
+    if ENV_FORCING[] !== nothing && (model.iteration == 1 || month_changed)
+        try
+            update_environment_from_asc!(model, current_date)
+        catch err
+            @warn "ASC environmental update failed at $(current_date): $err"
+        end
     end
 
     # Diel Vertical Migration (DVM) of resource pools
@@ -53,7 +82,7 @@ function TimeStep!(sim::MarineSimulation)
         model.daily_birth_counters = zeros(Int, species)
     end
 
-    if day_index == 1 && current_date != previous_date
+    if year(current_date) != year(previous_date)
         for fishery in fisheries
             fishery.cumulative_catch = 0.0
             fishery.cumulative_inds = 0
@@ -61,6 +90,9 @@ function TimeStep!(sim::MarineSimulation)
             fishery.bycatch_tonnage = 0.0
             fishery.bycatch_inds = 0
         end
+        # Biomass-linked quotas: recompute the new year's allowable catch from the
+        # current target-species biomass (fixed-quota fisheries are unchanged).
+        update_dynamic_quotas!(model)
     end
 
     # --- 4. Agent Life History & Behavior ---
@@ -115,14 +147,19 @@ function TimeStep!(sim::MarineSimulation)
             # --- AGENT CONSOLIDATION ---
             # Merge agents sharing location, size bin, generation, and birth step (dt).
             # This pass reduces agent count while preserving specific growth trajectories.
-            print("merge | ")
-            data_cpu = StructArray(NamedTuple(k => Array(v) for (k, v) in pairs(StructArrays.components(species_data))))
-            size_bin_thresholds_cpu = Array(model.size_bin_thresholds)
-            
-            merge_agents!(data_cpu, spec, size_bin_thresholds_cpu, Int(sim.ΔT),species_chars.School_Size[2][spec])
-            
-            # Sync consolidated results back to device memory
-            copyto!(species_data, data_cpu)
+            # Gated to a cadence: the merge copies the whole StructArray to the host,
+            # so running it every step is a major transfer cost. `merge_every` lets
+            # it run periodically with no change to the merge algorithm itself.
+            if RUNTIME_CONFIG[:merge_every] <= 1 || (model.iteration % RUNTIME_CONFIG[:merge_every] == 0)
+                print("merge | ")
+                data_cpu = StructArray(NamedTuple(k => Array(v) for (k, v) in pairs(StructArrays.components(species_data))))
+                size_bin_thresholds_cpu = Array(model.size_bin_thresholds)
+
+                merge_agents!(data_cpu, spec, size_bin_thresholds_cpu, Int(sim.ΔT),species_chars.School_Size[2][spec])
+
+                # Sync consolidated results back to device memory
+                copyto!(species_data, data_cpu)
+            end
         end
         
         # Increment age in days
@@ -148,6 +185,15 @@ function TimeStep!(sim::MarineSimulation)
         end
     else
         println("")
+    end
+
+    # --- 6b. Checkpoint (Gated by cadence) ---
+    if RUNTIME_CONFIG[:checkpoint_every] > 0 && (model.iteration % RUNTIME_CONFIG[:checkpoint_every] == 0)
+        try
+            save_checkpoint(sim)
+        catch err
+            @warn "Checkpoint write failed at iteration $(model.iteration): $err"
+        end
     end
 
     # --- 7. Buffer Maintenance ---

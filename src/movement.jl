@@ -34,28 +34,48 @@ function find_path(capacity::Matrix{Float32}, start::Tuple{Int,Int}, goal::Tuple
     f_score = Dict{Int, Float32}()
     f_score[start_idx] = heuristic(start_idx)
     
-    # open_set contains nodes to explore. We find the node with lowest f_score.
-    open_set = [start_idx]
+    # open_set is a binary min-heap of (f_score, node) with lazy deletion.
+    # This replaces the previous O(n)-per-pop linear scan, which dominated
+    # pathfinding cost for any non-trivial grid.
     came_from = Dict{Int, Int}()
-    
+    closed    = Set{Int}()
+
+    heap_push!(h, item) = begin
+        push!(h, item)
+        i = length(h)
+        @inbounds while i > 1
+            p = i >> 1
+            h[p][1] <= h[i][1] && break
+            h[p], h[i] = h[i], h[p]
+            i = p
+        end
+    end
+    heap_pop!(h) = begin
+        top = h[1]
+        n = length(h)
+        @inbounds h[1] = h[n]
+        pop!(h); n -= 1
+        i = 1
+        @inbounds while true
+            l = 2i; r = 2i + 1; s = i
+            (l <= n && h[l][1] < h[s][1]) && (s = l)
+            (r <= n && h[r][1] < h[s][1]) && (s = r)
+            s == i && break
+            h[i], h[s] = h[s], h[i]
+            i = s
+        end
+        return top
+    end
+
+    heap = Tuple{Float32, Int}[(f_score[start_idx], start_idx)]
+
     # Search directions (including diagonals)
     directions = [(1,0), (-1,0), (0,1), (0,-1), (1,1), (-1,-1), (1,-1), (-1,1)]
-    
-    while !isempty(open_set)
-        # Find index with lowest f_score (Priority selection)
-        best_f = Inf32
-        current = -1
-        current_in_open_idx = -1
-        
-        for (i, node) in enumerate(open_set)
-            f = get(f_score, node, Inf32)
-            if f < best_f
-                best_f = f
-                current = node
-                current_in_open_idx = i
-            end
-        end
-        
+
+    while !isempty(heap)
+        _, current = heap_pop!(heap)
+        current in closed && continue
+
         # Path Found: Reconstruct and return
         if current == goal_idx
             path = Tuple{Int, Int}[]
@@ -67,27 +87,27 @@ function find_path(capacity::Matrix{Float32}, start::Tuple{Int,Int}, goal::Tuple
             pushfirst!(path, start)
             return path
         end
-        
-        deleteat!(open_set, current_in_open_idx)
-        
+
+        push!(closed, current)
+
         cx, cy = from_idx(current)
         for (dx, dy) in directions
             nx, ny = cx + dx, cy + dy
-            
+
             if 1 <= nx <= lonres && 1 <= ny <= latres
                 if capacity[nx, ny] > 0
                     neighbor = to_idx(nx, ny)
+                    neighbor in closed && continue
                     # Cost: 1.0 for cardinal, ~1.41 for diagonal
                     step_cost = (dx == 0 || dy == 0) ? 1.0f0 : 1.414f0
                     tentative_g = g_score[current] + step_cost
-                    
+
                     if tentative_g < get(g_score, neighbor, Inf32)
                         came_from[neighbor] = current
                         g_score[neighbor] = tentative_g
-                        f_score[neighbor] = tentative_g + heuristic(neighbor)
-                        if !(neighbor in open_set)
-                            push!(open_set, neighbor)
-                        end
+                        f = tentative_g + heuristic(neighbor)
+                        f_score[neighbor] = f
+                        heap_push!(heap, (f, neighbor))
                     end
                 end
             end
@@ -285,6 +305,93 @@ function dvm_action!(model::MarineModel, sp::Int, is_weak_migrator::Bool)
     KernelAbstractions.synchronize(device(arch))
 end
 
+@kernel function dive_action_kernel!(
+    alive, dive_status, z, target_z, pool_z, active,
+    surface_z::Float32, swim_speed::Float32, depth_res_m, depthres, dt
+)
+    ind = @index(Global)
+    @inbounds if alive[ind] == 1.0f0
+        status = dive_status[ind]
+        if status != 0.0f0
+            curr_z = z[ind]
+            t_z    = target_z[ind]          # dive depth set on the CPU side each dive
+            z_increment = swim_speed * Float32(dt)
+
+            if status == 1.0f0 # Descending toward the dive target
+                new_z  = min(t_z, curr_z + z_increment)
+                z[ind] = new_z
+                # reached (within one step of) the dive depth -> start ascending
+                if new_z >= t_z - z_increment
+                    dive_status[ind] = 2.0f0
+                end
+            elseif status == 2.0f0 # Ascending back to the surface layer
+                new_z  = max(surface_z, curr_z - z_increment)
+                z[ind] = new_z
+                # back at the surface -> dive complete, becomes eligible to dive again
+                if new_z <= surface_z
+                    dive_status[ind] = 0.0f0
+                end
+            end
+
+            pool_z[ind] = clamp(ceil(Int, z[ind] / depth_res_m), 1, depthres)
+            active[ind] += dt
+        end
+    end
+end
+
+function dive_action!(model::MarineModel, sp::Int)
+    arch  = model.arch
+    data  = model.individuals.animals[sp].data
+    p_cpu = model.individuals.animals[sp].p
+    grid  = model.depths.grid
+    maxdepth    = grid[grid.Name .== "depthmax", :Value][1]
+    depthres    = Int(grid[grid.Name .== "depthres", :Value][1])
+    depth_res_m = maxdepth / depthres
+    t  = model.t          # minutes within the day (matches dvm_action!)
+    dt = model.dt
+
+    # Depth (m) that counts as "at the surface". Ascent terminates here and the
+    # animal becomes eligible to dive again on the next call.
+    surface_z = 5.0f0
+    # Vertical swim speed (m/min). Kept as a tunable constant as in the original.
+    swim_speed = 5.0f0
+
+    # Day vs night dive-depth envelope from species traits (cetacean analogues).
+    is_day = (360.0 <= t < 1080.0)
+    dmin = is_day ? Float32(p_cpu.Dive_Min_Day.second[sp])  : Float32(p_cpu.Dive_Min_Night.second[sp])
+    dmax = is_day ? Float32(p_cpu.Dive_Max_Day.second[sp])  : Float32(p_cpu.Dive_Max_Night.second[sp])
+
+    # ---- CPU-side trigger: surfaced animals begin a NEW dive ----
+    # The previous version flipped status 0 -> 1 but never (re)assigned target_z,
+    # so after the first dive the descent target was stale (often <= current
+    # depth). The kernel then satisfied `z >= t_z` immediately, the animal
+    # "bounced" at the surface, and no further dives occurred. Assigning a fresh,
+    # valid dive depth at the start of EVERY dive makes the cycle repeatable.
+    status_cpu = Array(data.mig_status)
+    gut_cpu    = Array(data.gut_fullness)
+    target_cpu = Array(data.target_z)
+
+    @inbounds for i in eachindex(status_cpu)
+        if status_cpu[i] == 0.0f0 && gut_cpu[i] < rand(Float32) * 0.5f0
+            # Draw a fresh dive depth within the species' day/night range.
+            if dmax > dmin
+                target_cpu[i] = dmin + rand(Float32) * (dmax - dmin)
+            else
+                # Fallback when no dive range is provided: dive well below surface.
+                target_cpu[i] = max(dmax, surface_z + 50.0f0)
+            end
+            status_cpu[i] = 1.0f0      # begin descending
+        end
+    end
+    copyto!(data.mig_status, status_cpu)
+    copyto!(data.target_z,   target_cpu)
+
+    kernel! = dive_action_kernel!(device(arch), 256, (length(data.x),))
+    kernel!(data.alive, data.mig_status, data.z, data.target_z, data.pool_z, data.active,
+            surface_z, swim_speed, depth_res_m, depthres, dt)
+    KernelAbstractions.synchronize(device(arch))
+end
+
 # ===================================================================
 # General Habitat-Seeking Movement
 # ===================================================================
@@ -320,6 +427,20 @@ function movement_toward_habitat!(model::MarineModel, sp::Int, time::AbstractArr
                 
                 len_m = cpu_length[ind] / 1000.0; swim_speed_ms = animal_param.Swim_velo[2][sp] * len_m; max_dist = swim_speed_ms * cpu_time[ind]
 
+                # --- Realistic per-step displacement cap -----------------------
+                # Without a cap, swim_speed * (weekly timestep) lets an agent cross
+                # the whole basin in one step, so each step is effectively an i.i.d.
+                # redraw from the capacity field and monthly snapshots look
+                # identical regardless of season. We cap NET displacement to a
+                # behavioural maximum (Move_Max_km_day, default 60 km/day net —
+                # well below the raw cruising path length, reflecting that fish do
+                # not swim in a straight line for a week). This makes movement track
+                # the seasonally shifting habitat optimum rather than teleporting.
+                move_cap_km_day = haskey(animal_param, :Move_Max_km_day) ?
+                    Float64(animal_param.Move_Max_km_day[2][sp]) : 60.0
+                disp_cap_m = move_cap_km_day * 1000.0 * (model.dt / 1440.0)
+                max_dist = min(max_dist, disp_cap_m)
+
                 # 1. Vertical adjustment
                 vertical_shift = (rand(Float32) * 10.0f0) - 5.0f0; vertical_shift = clamp(vertical_shift, -max_dist, max_dist)
                 max_horizontal_dist = max(0.0, max_dist - abs(vertical_shift))
@@ -334,19 +455,42 @@ function movement_toward_habitat!(model::MarineModel, sp::Int, time::AbstractArr
                     res = nearest_suitable_habitat(rng, habitat, cur_pos, start_pool, max_horizontal_dist, latmax, lonmin, cell_size)
                     if res !== nothing; new_y[ind], new_x[ind], new_pool_x[ind], new_pool_y[ind] = res; end
                 else
-                    # 2. Select goal
-                    r = rand(rng) * total_val 
-                    idx = findfirst(x -> x >= r, cumvals)
-                    
-                    if idx !== nothing
-                        goal_pool = (habitat_cells[idx].x, habitat_cells[idx].y)
-                        
+                    # 2. Select goal LOCALLY (gradient following within reach).
+                    # Restrict candidate goal cells to a window around the agent
+                    # sized by how far it can travel this step, and pick among them
+                    # weighted by habitat capacity. The agent therefore climbs the
+                    # local capacity gradient toward the best *reachable* habitat,
+                    # so as the SST-driven capacity field marches north in summer /
+                    # south in winter the population follows it — instead of being
+                    # redrawn from the global field every step.
+                    cell_size_m = cell_size * 111320.0            # deg -> m (latitude scale)
+                    reach_cells = max(1, ceil(Int, max_horizontal_dist / max(cell_size_m, 1.0)))
+                    sx, sy = start_pool[1], start_pool[2]
+                    xlo = max(1, sx - reach_cells); xhi = min(lonres, sx + reach_cells)
+                    ylo = max(1, sy - reach_cells); yhi = min(latres, sy + reach_cells)
+
+                    # Weighted reservoir pick over in-window cells with capacity>0.
+                    chosen_x = sx; chosen_y = sy; wsum = 0.0
+                    @inbounds for gx in xlo:xhi, gy in ylo:yhi
+                        v = habitat[gx, gy]
+                        v <= 0 && continue
+                        # weight by capacity, mildly favouring improvement over the
+                        # current cell so movement is directed up-gradient
+                        w = Float64(v)
+                        wsum += w
+                        if rand(rng) * wsum <= w
+                            chosen_x = gx; chosen_y = gy
+                        end
+                    end
+                    goal_pool = (chosen_x, chosen_y)
+
+                    if goal_pool != start_pool
                         # --- MEMOIZATION CHECK (Option 2) ---
                         cache_key = (to_idx(start_pool...), to_idx(goal_pool...))
                         path = lock(cache_lock) do
                             get(path_cache, cache_key, nothing)
                         end
-                        
+
                         if isnothing(path)
                             path = find_path(habitat, start_pool, goal_pool)
                             if !isnothing(path)
@@ -355,8 +499,8 @@ function movement_toward_habitat!(model::MarineModel, sp::Int, time::AbstractArr
                                 end
                             end
                         end
-                        
-                        # 3. Travel along full path (Option 1 Benefit: Higher Path Quality)
+
+                        # 3. Travel along the path, bounded by the capped distance.
                         if path !== nothing && length(path) > 1
                             res_lat, res_lon, res_pool_y, res_pool_x = reachable_point(rng, cur_pos, path, max_horizontal_dist, latmax, lonmin, cell_size, lonres, latres)
                             new_y[ind], new_x[ind], new_pool_y[ind], new_pool_x[ind] = res_lat, res_lon, res_pool_y, res_pool_x
