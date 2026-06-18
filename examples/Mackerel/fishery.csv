@@ -1,6 +1,6 @@
-FisheryName,Species,Role,SelectivityType,L50,Slope,L50_2,Slope_2,Quota,StartDay,EndDay,XMin,XMax,YMin,YMax,ZMin,ZMax,SlotMin,SlotMax,BagLimit,NVessel
-Rec_Gulfwide,King Mackerel,target,logistic,650,0.015,0,0,3081,0,365,-98,-82,24,31,0,150,610,10000,3,1000
-Comm_Western_Zone,King Mackerel,target,logistic,700,0.02,0,0,580,0,365,-98,-87.5,25,30,20,200,610,10000,6,50
-Comm_Northern_Zone,King Mackerel,target,logistic,750,0.02,0,0,261,0,365,-87.5,-84,28,30.5,20,200,610,10000,6,50
-Comm_Southern_HookLine,King Mackerel,target,knife_edge,800,0,0,0,304,0,365,-87.5,-82,24,28,20,200,610,10000,6,50
-Comm_Southern_Gillnet,King Mackerel,target,dome_shaped,610,0.05,900,0.02,304,21,365,-84,-82,24,26,10,100,610,10000,230,20
+FisheryName,Species,Role,SelectivityType,L50,Slope,L50_2,Slope_2,Quota,StartDay,EndDay,XMin,XMax,YMin,YMax,ZMin,ZMax,SlotMin,SlotMax,BagLimit,NVessel,QuotaMode,HarvestRate,QuotaMin,QuotaMax,Blim,Bthr
+Rec_Gulfwide,King Mackerel,target,logistic,650,0.015,0,0,1000,0,365,-98,-82,24,31,0,150,610,10000,3,1000,rate,0.2,0,0,0,0
+Comm_Western_Zone,King Mackerel,target,logistic,700,0.02,0,0,580,0,365,-98,-87.5,25,30,20,200,610,10000,6,50,rate,0.05,0,0,0,0
+Comm_Northern_Zone,King Mackerel,target,logistic,750,0.02,0,0,261,0,365,-87.5,-84,28,30.5,20,200,610,10000,6,50,rate,0.05,0,0,0,0
+Comm_Southern_HookLine,King Mackerel,target,knife_edge,800,0,0,0,304,0,365,-87.5,-82,24,28,20,200,610,10000,6,50,rate,0.05,0,0,0,0
+Comm_Southern_Gillnet,King Mackerel,target,dome_shaped,610,0.05,900,0.02,304,21,365,-84,-82,24,26,10,100,610,10000,230,20,rate,0.05,0,0,0,0

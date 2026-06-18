@@ -1,20 +1,18 @@
-SpeciesLong,January,February,March,April,May,June,July,August,September,October,November,December
-Copepods & Small Zoop.,0.4,0.6,1.5,2.2,1.8,1.5,1.2,1,0.8,0.6,0.5,0.4
-Krill & Euphausiids,0.5,0.7,1.6,2.4,2,1.6,1.3,1.1,0.9,0.7,0.6,0.5
-Gelatinous Zooplankton,0.6,0.8,1.4,1.8,1.6,1.4,1.2,1,0.9,0.8,0.7,0.6
-Anchovy-Sardine Guild,0.7,0.8,1.3,1.6,1.5,1.3,1.1,1,0.9,0.8,0.7,0.7
-Herring-Flying Fish Guild,0.7,0.8,1.3,1.6,1.5,1.3,1.1,1,0.9,0.8,0.7,0.7
-Pelagic Invertebrates,0.8,0.9,1.2,1.4,1.3,1.2,1.1,1,0.9,0.9,0.8,0.8
-Bullet-Frigate Mackerel,0.9,0.9,1.1,1.2,1.2,1.1,1,1,1,1,0.9,0.9
-Longfin Squid,0.8,0.9,1.2,1.5,1.4,1.2,1.1,1,0.9,0.9,0.8,0.8
-Spanish Mackerel,0.9,0.9,1.1,1.2,1.2,1.1,1,1,1,1,0.9,0.9
-Little Tunny,0.9,0.9,1.1,1.2,1.2,1.1,1,1,1,1,0.9,0.9
-Dolphin Fish (Mahi-mahi),0.8,0.9,1.2,1.4,1.3,1.2,1.1,1,0.9,0.9,0.8,0.8
-Bluefish,0.9,0.9,1.1,1.2,1.2,1.1,1,1,1,1,0.9,0.9
-Wahoo,1,1,1,1.1,1.1,1.1,1,1,1,1,1,1
-Sailfish,1,1,1,1.1,1.1,1.1,1,1,1,1,1,1
-Blackfin Tuna,0.9,0.9,1.1,1.2,1.2,1.1,1,1,1,1,0.9,0.9
-Silky/Dusky Sharks,1,1,1,1,1,1,1,1,1,1,1,1
-Bull Shark,1,1,1,1,1,1,1,1,1,1,1,1
-Great Barracuda,1,1,1,1.1,1.1,1.1,1,1,1,1,1,1
-Bottlenose Dolphin,1,1,1,1,1,1,1,1,1,1,1,1
+Species,January,February,March,April,May,June,July,August,September,October,November,December
+Copepods & Small Zoop.,0.8,0.9,1.2,1.5,1.4,1.2,1.1,1.0,1.0,0.9,0.8,0.7
+Krill & Euphausiids,0.7,0.8,1.1,1.4,1.5,1.3,1.1,1.0,0.9,0.8,0.7,0.7
+Gelatinous Zooplankton,0.6,0.7,0.9,1.2,1.5,1.6,1.5,1.3,1.1,0.8,0.6,0.5
+Anchovy-Sardine-Menhaden,0.9,0.9,1.0,1.2,1.3,1.2,1.1,1.1,1.0,1.0,0.9,0.9
+Small pelagic fish,0.9,0.9,1.0,1.1,1.2,1.2,1.1,1.1,1.1,1.0,0.9,0.9
+Pelagic Invertebrates,0.8,0.8,1.0,1.3,1.4,1.3,1.2,1.1,1.0,0.9,0.8,0.8
+Spanish Mackerel,1.0,1.0,1.0,1.0,1.1,1.1,1.1,1.1,1.0,1.0,1.0,1.0
+Other Mackerel,1.0,1.0,1.0,1.0,1.1,1.1,1.1,1.1,1.0,1.0,1.0,1.0
+Cephalopods,0.8,0.9,1.1,1.2,1.3,1.3,1.2,1.1,1.1,1.0,0.9,0.8
+Small tunas,1.0,1.0,1.0,1.0,1.1,1.1,1.1,1.1,1.0,1.0,1.0,1.0
+Pelagic fishes,0.9,0.9,1.0,1.1,1.2,1.2,1.1,1.1,1.1,1.0,0.9,0.9
+Medium-sized fishes,0.9,0.9,1.0,1.1,1.2,1.2,1.1,1.1,1.1,1.0,0.9,0.9
+Other Large Sharks,0.9,0.9,1.0,1.1,1.1,1.1,1.1,1.1,1.0,1.0,0.9,0.9
+Large coastal pelagics,0.9,0.9,1.0,1.1,1.1,1.1,1.1,1.1,1.0,1.0,0.9,0.9
+Cetaceans,0.9,0.9,1.0,1.1,1.1,1.1,1.1,1.1,1.0,1.0,0.9,0.9
+Benthic Crustaceans,0.8,0.8,1.0,1.2,1.4,1.4,1.3,1.2,1.1,1.0,0.9,0.8
+Demersal Forage Fishes,0.9,0.9,1.0,1.1,1.2,1.2,1.1,1.1,1.1,1.0,0.9,0.9

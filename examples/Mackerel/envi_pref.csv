@@ -1,61 +1,67 @@
 species,variable,pref_min,opt_min,opt_max,pref_max
 King Mackerel,temp-surf,22,25,29,31
-King Mackerel,bathymetry,5,15,150,250
+King Mackerel,bathymetry,0,0,150,250
 King Mackerel,salinity,28,32,36,38
 Copepods & Small Zoop.,temp-surf,12,18,28,34
-Copepods & Small Zoop.,bathymetry,0,5,150,500
+Copepods & Small Zoop.,bathymetry,0,1,400,500
 Copepods & Small Zoop.,salinity,24,30,36,38
 Krill & Euphausiids,temp-surf,10,16,26,32
-Krill & Euphausiids,bathymetry,0,20,250,800
+Krill & Euphausiids,bathymetry,0,1,400,800
 Krill & Euphausiids,salinity,26,32,36,38
 Gelatinous Zooplankton,temp-surf,14,20,30,35
-Gelatinous Zooplankton,bathymetry,0,5,200,600
+Gelatinous Zooplankton,bathymetry,0,1,400,600
 Gelatinous Zooplankton,salinity,25,30,36,38
 Anchovy-Sardine Guild,temp-surf,16,21,29,33
-Anchovy-Sardine Guild,bathymetry,5,10,150,250
+Anchovy-Sardine Guild,bathymetry,0,1,400,600
 Anchovy-Sardine Guild,salinity,27,32,36,38
-Herring-Flying Fish Guild,temp-surf,18,22,30,34
-Herring-Flying Fish Guild,bathymetry,2,5,100,200
-Herring-Flying Fish Guild,salinity,28,33,36,38
+Small pelagic fish,temp-surf,18,22,30,34
+Small pelagic fish,bathymetry,0,1,400,600
+Small pelagic fish,salinity,28,33,36,38
 Pelagic Invertebrates,temp-surf,12,17,28,33
-Pelagic Invertebrates,bathymetry,10,50,400,1000
+Pelagic Invertebrates,bathymetry,0,1,400,1000
 Pelagic Invertebrates,salinity,30,34,37,38
-Bullet-Frigate Mackerel,temp-surf,20,24,31,34
-Bullet-Frigate Mackerel,bathymetry,10,25,200,400
-Bullet-Frigate Mackerel,salinity,30,34,37,38
-Longfin Squid,temp-surf,15,18,28,32
-Longfin Squid,bathymetry,20,50,300,500
-Longfin Squid,salinity,30,33,36,38
+Benthic Crustaceans,temp-surf,15,20,28,32
+Benthic Crustaceans,bathymetry,0,2,100,200
+Benthic Crustaceans,salinity,15,25,36,38
+Demersal Forage Fishes,temp-surf,16,21,28,32
+Demersal Forage Fishes,bathymetry,0,5,150,250
+Demersal Forage Fishes,salinity,20,28,36,38
+Other Mackerel,temp-surf,20,24,31,34
+Other Mackerel,bathymetry,0,25,200,400
+Other Mackerel,salinity,30,34,37,38
+Cephalopods,temp-surf,15,18,28,32
+Cephalopods,bathymetry,20,50,300,500
+Cephalopods,salinity,28,33,36,38
 Spanish Mackerel,temp-surf,19,23,31,35
-Spanish Mackerel,bathymetry,3,10,100,200
+Spanish Mackerel,bathymetry,0,10,100,200
 Spanish Mackerel,salinity,26,30,36,38
-Little Tunny,temp-surf,20,24,30,33
-Little Tunny,bathymetry,100,200,1000,4000
-Little Tunny,salinity,30,33,36,38
-Dolphin Fish (Mahi-mahi),temp-surf,21,25,31,34
-Dolphin Fish (Mahi-mahi),bathymetry,1,200,1000,4000
-Dolphin Fish (Mahi-mahi),salinity,28,32,36,38
-Bluefish,temp-surf,15,20,28,32
-Bluefish,bathymetry,2,10,120,200
-Bluefish,salinity,22,28,36,38
-Wahoo,temp-surf,21,24,29,32
-Wahoo,bathymetry,1,200,1000,4000
-Wahoo,salinity,30,34,37,38
-Sailfish,temp-surf,22,25,29,31
-Sailfish,bathymetry,100,200,1000,4000
-Sailfish,salinity,31,34,37,38
-Blackfin Tuna,temp-surf,20,23,29,32
-Blackfin Tuna,bathymetry,100,200,1000,4000
-Blackfin Tuna,salinity,31,34,37,38
-Silky-Dusky Sharks,temp-surf,19,23,30,34
-Silky-Dusky Sharks,bathymetry,10,50,500,1200
-Silky-Dusky Sharks,salinity,28,32,36,38
-Bull Shark,temp-surf,18,22,32,35
-Bull Shark,bathymetry,1,2,50,150
-Bull Shark,salinity,5,15,35,38
-Great Barracuda,temp-surf,22,25,31,34
-Great Barracuda,bathymetry,2,5,80,150
-Great Barracuda,salinity,28,32,36,38
-Bottlenose Dolphin,temp-surf,15,20,32,36
-Bottlenose Dolphin,bathymetry,1,5,100,400
-Bottlenose Dolphin,salinity,20,28,36,38
+Small tunas,temp-surf,20,24,30,33
+Small tunas,bathymetry,50,200,1000,4000
+Small tunas,salinity,30,33,36,38
+Pelagic fishes,temp-surf,21,25,31,34
+Pelagic fishes,bathymetry,0,200,1000,4000
+Pelagic fishes,salinity,28,32,36,38
+Medium-sized fishes,temp-surf,15,20,28,32
+Medium-sized fishes,bathymetry,0,10,120,200
+Medium-sized fishes,salinity,22,28,36,38
+Oceanic pelagics,temp-surf,21,24,29,32
+Oceanic pelagics,bathymetry,50,200,1000,4000
+Oceanic pelagics,salinity,30,34,37,38
+Billfishes,temp-surf,22,25,29,31
+Billfishes,bathymetry,50,200,1000,4000
+Billfishes,salinity,31,34,37,38
+Tunas,temp-surf,20,23,29,32
+Tunas,bathymetry,50,200,1000,4000
+Tunas,salinity,31,34,37,38
+Pelagic sharks,temp-surf,19,23,30,34
+Pelagic sharks,bathymetry,10,50,500,1200
+Pelagic sharks,salinity,28,32,36,38
+Other Large Sharks,temp-surf,18,22,32,35
+Other Large Sharks,bathymetry,0,2,50,150
+Other Large Sharks,salinity,5,15,35,38
+Large coastal pelagics,temp-surf,22,25,31,34
+Large coastal pelagics,bathymetry,0,5,80,150
+Large coastal pelagics,salinity,28,32,36,38
+Cetaceans,temp-surf,15,20,32,36
+Cetaceans,bathymetry,0,5,100,400
+Cetaceans,salinity,20,28,36,38

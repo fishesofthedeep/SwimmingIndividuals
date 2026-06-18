@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SwimmingIndividuals environmental forcing configuration.
+
+  One <Variable> per environmental field. The four driver fields plus npp share a
+  single monthly <TimeSpan> and build the monthly habitat-capacity layers (drivers
+  feed the habitat preference envelope; npp scales resource carrying capacity).
+  Monthly files resolve as  <env_dir>/<dir>/<file>, where <env_dir> is the
+  files.csv "env_dir" row (here: EnvData), dir defaults to <name>, and file
+  defaults to "<name>_{Y}-{M}.asc"  ({Y}=4-digit year, {M}=2-digit month).
+  So tos for July 2026 is  EnvData/tos/tos_2026-07.asc.
+
+  If the run extends past <TimeSpan end>, the final year is repeated.
+
+  role:  "driver" = habitat preference envelope (tos/tob/sos/sob)
+         "relpp"  = relative primary production -> resource carrying capacity (npp)
+         "static" = one time-invariant raster reused for all dates (bathymetry)
+
+  STATIC layers (e.g. bathymetry) have no {Y}/{M} in their filename, so they are
+  loaded once. To keep bathymetry.asc directly in EnvData (not a subfolder), set
+  dir="." so it resolves to  EnvData/bathymetry.asc.
+-->
+<EnvironmentConfig name="Mackerel" description="Monthly MOM6 drivers + NPP for SwimmingIndividuals">
+  <TimeSpan start="1980-01" end="2040-12"/>
+
+  <Variable name="tos" role="driver"/>   <!-- sea surface temperature       -->
+  <Variable name="tob" role="driver"/>   <!-- sea bottom temperature         -->
+  <Variable name="sos" role="driver"/>   <!-- sea surface salinity           -->
+  <Variable name="sob" role="driver"/>   <!-- sea bottom salinity            -->
+  <Variable name="npp" role="relpp"/>    <!-- relative net primary production -->
+
+  <Variable name="bathymetry" role="static" dir="." file="bathymetry.asc"/>
+</EnvironmentConfig>
