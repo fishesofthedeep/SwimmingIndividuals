@@ -62,7 +62,7 @@ function read_recruitment_params(model::MarineModel, sp::Int, spawner_map::Abstr
     return T_opt, T_sd, dd_beta, sigma_R
 end
 
-function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outputs,current_date)
+function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outputs, current_date)
     arch = model.arch
     p_cpu = model.individuals.animals[sp].p
     dt = model.dt
@@ -71,18 +71,31 @@ function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outp
     agent_data_device = model.individuals.animals[sp].data
 
     data_cpu = StructArray(
-        unique_id = Array(agent_data_device.unique_id),x = Array(agent_data_device.x), y = Array(agent_data_device.y), z = Array(agent_data_device.z),
-        length = Array(agent_data_device.length), abundance = Array(agent_data_device.abundance),
-        biomass_ind = Array(agent_data_device.biomass_ind), biomass_school = Array(agent_data_device.biomass_school), biomass_init = Array(agent_data_device.biomass_init),
-        energy = Array(agent_data_device.energy), gut_fullness = Array(agent_data_device.gut_fullness),
-        cost = Array(agent_data_device.cost), pool_x = Array(agent_data_device.pool_x),
-        pool_y = Array(agent_data_device.pool_y), pool_z = Array(agent_data_device.pool_z),
-        active = Array(agent_data_device.active), ration_biomass = Array(agent_data_device.ration_biomass),ration_energy = Array(agent_data_device.ration_energy),
-        alive = Array(agent_data_device.alive), vis_prey = Array(agent_data_device.vis_prey),
-        target_pool_x = Array(agent_data_device.target_pool_x),
-        target_pool_y = Array(agent_data_device.target_pool_y),
-        mature = Array(agent_data_device.mature), age = Array(agent_data_device.age),
-        cell_id = Array(agent_data_device.cell_id), sorted_id = Array(agent_data_device.sorted_id),
+        unique_id = Array(agent_data_device.unique_id), 
+        x = Array(agent_data_device.x), 
+        y = Array(agent_data_device.y), 
+        z = Array(agent_data_device.z),
+        length = Array(agent_data_device.length), 
+        abundance = Array(agent_data_device.abundance),
+        biomass_ind = Array(agent_data_device.biomass_ind), 
+        biomass_school = Array(agent_data_device.biomass_school), 
+        biomass_init = Array(agent_data_device.biomass_init),
+        energy = Array(agent_data_device.energy), 
+        gut_fullness = Array(agent_data_device.gut_fullness),
+        cost = Array(agent_data_device.cost), 
+        pool_x = Array(agent_data_device.pool_x), 
+        pool_y = Array(agent_data_device.pool_y),
+        pool_z = Array(agent_data_device.pool_z), 
+        active = Array(agent_data_device.active), 
+        ration_energy = Array(agent_data_device.ration_energy), 
+        ration_biomass = Array(agent_data_device.ration_biomass), 
+        alive = Array(agent_data_device.alive), 
+        vis_prey = Array(agent_data_device.vis_prey), 
+        mature = Array(agent_data_device.mature), 
+        age = Array(agent_data_device.age),
+        generation = Array(agent_data_device.generation),
+        cell_id = Array(agent_data_device.cell_id), 
+        sorted_id = Array(agent_data_device.sorted_id),
         repro_energy = Array(agent_data_device.repro_energy),
         best_prey_dist = Array(agent_data_device.best_prey_dist),
         best_prey_idx = Array(agent_data_device.best_prey_idx),
@@ -95,7 +108,8 @@ function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outp
         mig_status = Array(agent_data_device.mig_status),
         target_z = Array(agent_data_device.target_z),
         interval = Array(agent_data_device.interval),
-        generation = Array(agent_data_device.generation)
+        target_pool_x = Array(agent_data_device.target_pool_x),
+        target_pool_y = Array(agent_data_device.target_pool_y)
     )
     
     daily_births = model.daily_birth_counters[sp]
@@ -108,22 +122,52 @@ function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outp
     spawn_season = CSV.read(model.files[model.files.File .== "reproduction", :Destination][1], DataFrame)
     species_name = p_cpu.SpeciesLong.second[sp]
     row_idx = findfirst(==(species_name), spawn_season.Species)
-    spawn_val = row_idx !== nothing ? spawn_season[row_idx, model.environment.ts + 1] : 0.0
+    
+    # Robust seasonal spawning value lookup to prevent string column index crashes
+    spawn_val = 0.0
+    if row_idx !== nothing
+        current_month_name = Dates.monthname(current_date)
+        if current_month_name in names(spawn_season)
+            val = spawn_season[row_idx, current_month_name]
+            if !ismissing(val)
+                spawn_val = Float64(val)
+            end
+        else
+            short_month_name = current_month_name[1:min(3, length(current_month_name))]
+            if short_month_name in names(spawn_season)
+                val = spawn_season[row_idx, short_month_name]
+                if !ismissing(val)
+                    spawn_val = Float64(val)
+                end
+            elseif (model.environment.ts + 2) <= size(spawn_season, 2)
+                # Fallback to column index offset (skipping Species column)
+                val = spawn_season[row_idx, model.environment.ts + 2]
+                if !ismissing(val) && typeof(val) <: Number
+                    spawn_val = Float64(val)
+                end
+            end
+        end
+    end
     
     for ind in 1:length(data_cpu.x)
         if (data_cpu.alive[ind] == 1.0) && (data_cpu.age[ind] > p_cpu.Larval_Duration.second[sp])
 
             # Gather Agent Properties
-            my_temp = temp_cpu[ind]; my_consumed = data_cpu.ration_energy[ind]
+            my_temp = temp_cpu[ind]
+            my_consumed = data_cpu.ration_energy[ind]
             my_weight_ind = data_cpu.biomass_ind[ind]
             my_active_time = data_cpu.active[ind] / dt
             my_abundance = data_cpu.abundance[ind]
-            my_z = data_cpu.z[ind]; my_length = data_cpu.length[ind]
-            my_energy = data_cpu.energy[ind]; my_mature = data_cpu.mature[ind]
+            my_z = data_cpu.z[ind]
+            my_length = data_cpu.length[ind]
+            my_energy = data_cpu.energy[ind]
+            my_mature = data_cpu.mature[ind]
 
             # Get Species-Specific Trait Codes
-            energy_ed = p_cpu.Energy_density.second[sp]; taxa_code = p_cpu.Taxa.second[sp]
-            energy_type_code = p_cpu.MR_type.second[sp]; max_size = p_cpu.Max_Size.second[sp]
+            energy_ed = p_cpu.Energy_density.second[sp]
+            taxa_code = p_cpu.Taxa.second[sp]
+            energy_type_code = p_cpu.MR_type.second[sp]
+            max_size = p_cpu.Max_Size.second[sp]
 
             activity_multiplier = p_cpu.Activity_Mult.second[sp]
 
@@ -143,11 +187,14 @@ function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outp
                     R_ind = cost_resting + cost_active
                 elseif energy_type_code == 3 # "deepsea"
                     depth = max(1.0, my_z)
-                    log_weight = log(my_weight_ind); inv_temp = 1000.0 / (273.15 + my_temp); log_depth = log(depth)
+                    log_weight = log(my_weight_ind)
+                    inv_temp = 1000.0 / (273.15 + my_temp)
+                    log_depth = log(depth)
                     lnr = (taxa_code == 1 ? 19.491 + 0.885*log_weight - 5.770*inv_temp - 0.261*log_depth :
                            taxa_code == 2 ? 28.326 + 0.779*log_weight - 7.903*inv_temp - 0.365*log_depth :
                            18.775 + 0.766*log_weight - 5.265*inv_temp - 0.113*log_depth)
-                    rate_mg_per_kg_per_hr = exp(lnr); my_weight_kg = my_weight_ind / 1000.0
+                    rate_mg_per_kg_per_hr = exp(lnr)
+                    my_weight_kg = my_weight_ind / 1000.0
                     rate_mg_per_ind_per_hr = rate_mg_per_kg_per_hr * my_weight_kg
                     rate_J_per_hr = rate_mg_per_ind_per_hr * oxy_joules_per_mg
                     rmr = rate_J_per_hr * (dt / 60.0)
@@ -155,17 +202,28 @@ function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outp
                     cost_active = (rmr * activity_multiplier) * my_active_time
                     R_ind = cost_resting + cost_active
                 else # Default
-                    resp_a = p_cpu.Resp_a.second[sp]; resp_b = p_cpu.Resp_b.second[sp]; resp_q = p_cpu.Resp_q.second[sp]
-                    # 1. Calculate mass-specific rate (mg O2 / g / day)
-                    smr_mass_specific = resp_a * my_weight_ind^resp_b
+                    resp_a = p_cpu.Resp_a.second[sp]
+                    resp_b = p_cpu.Resp_b.second[sp]
+                    resp_q = p_cpu.Resp_q.second[sp]
                     
-                    # 2. Apply temperature correction
-                    smr_temp_corrected = smr_mass_specific * exp(resp_q * my_temp)
+                    # Robust handling of standard metabolic weight-scaling conventions.
+                    # Prevents SMR double weight-scaling when positive literature exponents are loaded.
+                    if resp_b < 0.0
+                        smr_mass_specific = resp_a * my_weight_ind^resp_b
+                        
+                        # SMR Metabolic Cap for Micro-Sizes
+                        smr_mass_specific = min(smr_mass_specific, 2.5f0)
+                        
+                        smr_temp_corrected = smr_mass_specific * exp(resp_q * my_temp)
+                        smr_total_daily = smr_temp_corrected * my_weight_ind
+                    else
+                        smr_individual = resp_a * my_weight_ind^resp_b
+                        smr_total_daily = smr_individual * exp(resp_q * my_temp)
+                        # Parallel SMR cap for standard positive weight scales
+                        smr_total_daily = min(smr_total_daily, 2.5f0 * my_weight_ind * exp(resp_q * my_temp))
+                    end
                     
-                    # 3. Calculate total rate for the individual (mg O2 / ind / day)
-                    smr_total_daily = smr_temp_corrected * my_weight_ind
-                    
-                    # 4. Convert to Joules per timestep
+                    # Convert to Joules per day
                     smr_joules_per_day = smr_total_daily * oxy_joules_per_mg
                     smr_per_timestep = smr_joules_per_day * (dt / 1440.0)
                     
@@ -177,28 +235,15 @@ function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outp
             end
 
             # --- Net Energy and Gut Evacuation ---
-            sda_coeff, egestion_coeff, excretion_coeff = 0.15,0.2,0.08
+            sda_coeff, egestion_coeff, excretion_coeff = 0.15, 0.2, 0.08
             total_waste_and_cost = R + (my_consumed * (sda_coeff + egestion_coeff + excretion_coeff))
             if ismissing(total_waste_and_cost)
                 continue
             end
             net_energy = my_consumed - total_waste_and_cost
             data_cpu.cost[ind] = total_waste_and_cost
-            
-            # The agent's total energy reserve is updated
-            my_energy += net_energy
 
-            # --- Gut evacuation -------------------------------------------------
-            # `evac_prop` is the per-HOUR evacuated fraction (Elliott & Persson 1978
-            # exponential evacuation, temperature-dependent). The update
-            # gut *= (1 - evac_prop)^(hours) is a continuous decay and is therefore
-            # dt-robust: at a 30-min step it removes a little, at a weekly step it
-            # drives the gut to ~0 (a mackerel gut turns over in well under a day,
-            # so full evacuation across a week is correct). NOTE: gut evacuation does
-            # NOT gate movement here — `decision()` always passes the full timestep
-            # to `movement_toward_habitat!`, so feeding cannot "use up" the time an
-            # agent has to move. (Guard against non-finite temperatures, which can
-            # now occur where an ASC driver layer has NODATA.)
+            # --- Gut evacuation ---
             safe_temp = isfinite(my_temp) ? my_temp : 20.0
             evac_prop = clamp(0.053 * exp(0.073 * safe_temp), 0.0, 1.0)
             if evac_prop < 1.0
@@ -208,89 +253,143 @@ function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outp
             end
 
             # ===================================================================
+            # --- PHYSIOLOGICALLY CORRECT PRIORITY-BASED RESERVE ALLOCATION ---
+            # ===================================================================
+            # Maximum reserve capacity set to 20%. Minimum safeguard of 2.5 Joules per agent.
+            reserve_cap = max(2.5f0 * my_abundance, 0.20 * my_weight_ind * my_abundance * energy_ed)
+
+            surplus_energy = 0.0
+            if net_energy < 0.0
+                # Deficit: Draw down the reserve buffer
+                my_energy += net_energy
+                surplus_energy = 0.0
+            else
+                # Surplus: First priority is to rebuild the reserve buffer back to cap
+                space_in_reserve = max(0.0, reserve_cap - my_energy)
+                allocated_to_reserve = min(net_energy, space_in_reserve)
+                my_energy += allocated_to_reserve
+                
+                # Second priority: Remaining surplus is used for growth & reproduction
+                surplus_energy = net_energy - allocated_to_reserve
+            end
+
+            # Cap the reserve strictly
+            if reserve_cap > 0.0 && my_energy > reserve_cap
+                my_energy = reserve_cap
+            end
+
+            data_cpu.energy[ind] = my_energy
+
+            # ===================================================================
             # --- Growth & Reproduction Logic ---
             # ===================================================================
-            lwr_a = p_cpu.LWR_a.second[sp]; lwr_b = p_cpu.LWR_b.second[sp]
+            lwr_a = p_cpu.LWR_a.second[sp]
+            lwr_b = p_cpu.LWR_b.second[sp]
             
-            # Surplus energy is any energy available above metabolic costs.
-            surplus_energy = max(0.0, net_energy)
+            growth_energy = 0.0
+            repro_energy_gain = 0.0
 
-            if my_length < max_size && surplus_energy > 0.0
+            if surplus_energy > 0.0
                 L50 = p_cpu.L_mat.second[sp]
-                growth_energy = 0.0
-                repro_energy_gain = 0.0
 
                 if my_mature == 0.0
                     # --- IMMATURE: All surplus energy goes to somatic growth ---
-                    growth_energy = surplus_energy
+                    if my_length < max_size
+                        growth_energy = surplus_energy
+                    end
                 else
                     # --- MATURE: Partition energy between growth and reproduction ---
-                    # This function creates a smooth switch from growth to reproduction
-                    # as the agent approaches its maximum size.
-                    min_growth_allocation = 0.1 
-                    energy_for_repro = surplus_energy * (1.0 - min_growth_allocation)
+                    if my_length < max_size
+                        # Reproductive allocation ramps in over the POST-MATURITY size range
+                        # (L_mat -> max_size), not the whole 0 -> max_size range. A just-matured
+                        # fish (my_length ~ L50) therefore keeps directing nearly all surplus to
+                        # somatic growth, giving continuous biphasic growth that tracks the von
+                        # Bertalanffy curve past maturity; reproductive investment accelerates
+                        # only as the fish nears max_size.
+                        min_growth_allocation = 0.1
+                        energy_for_repro = surplus_energy * (1.0 - min_growth_allocation)
 
-                    repro_prop = (my_length / max_size)^1.5
-                    repro_prop = clamp(repro_prop, 0.0, 1.0)
-                    
-                    repro_energy_gain = energy_for_repro * repro_prop
-                    growth_energy = (surplus_energy * min_growth_allocation) + (energy_for_repro - repro_energy_gain)
+                        repro_ramp_exponent = 2.0   # >1 keeps small mature fish growing; lower => earlier repro
+                        mature_frac = (my_length - L50) / max(1.0, (max_size - L50))
+                        repro_prop = clamp(mature_frac, 0.0, 1.0)^repro_ramp_exponent
+
+                        repro_energy_gain = energy_for_repro * repro_prop
+                        growth_energy = (surplus_energy * min_growth_allocation) + (energy_for_repro - repro_energy_gain)
+                    else
+                        # Fully grown: 100% of surplus energy goes to reproduction
+                        repro_energy_gain = surplus_energy
+                        growth_energy = 0.0
+                    end
                 end
 
-                # --- Apply Somatic Growth ---
+                # --- Apply Somatic Growth (Somatic Synthesis Efficiency Check) ---
                 if growth_energy > 0.0
-                    # Convert growth energy to biomass for an individual
-                    growth_biomass_ind = (growth_energy / my_abundance) / energy_ed
+                    somatic_efficiency = 0.45 - 0.15 * (my_length / max_size)
+                    somatic_efficiency = clamp(somatic_efficiency, 0.3, 0.45)
+                    
+                    efficient_growth_energy = growth_energy * somatic_efficiency
+
+                    # Convert efficient growth energy to biomass for an individual
+                    growth_biomass_ind = (efficient_growth_energy / my_abundance) / energy_ed
                     new_biomass_ind = my_weight_ind + growth_biomass_ind
                     new_length = 10.0 * (new_biomass_ind / lwr_a)^(1.0 / lwr_b)
                     
                     # Update agent state
                     data_cpu.biomass_ind[ind] = new_biomass_ind
                     data_cpu.length[ind] = new_length
-                    data_cpu.biomass_school[ind] += (growth_energy / energy_ed)
+                    data_cpu.biomass_school[ind] += (efficient_growth_energy / energy_ed)
 
-                    # Check for maturation
-                    if new_length >= L50 && my_mature == 0.0
+                    # Maturation check
+                    if new_length >= L50 && my_mature < 1.0
                         data_cpu.mature[ind] = 1.0
                     end
                 end
 
-                # --- Apply Reproductive Energy ---
+                # --- Apply Reproductive Energy with Gonad Synthesis Efficiency ---
                 if my_mature == 1.0 && repro_energy_gain > 0.0
-                    data_cpu.repro_energy[ind] += repro_energy_gain
+                    repro_efficiency = 0.45  # Gonad tissue synthesis biochemical conversion efficiency
+                    data_cpu.repro_energy[ind] += (repro_energy_gain * repro_efficiency)
                 end
             end
 
-            data_cpu.energy[ind] = my_energy
-            
-            # --- Starvation ---
+            # ===================================================================
+            # --- Digested Ration: retained for output, reset end-of-timestep ---
+            # ===================================================================
+
+            # --- Starvation check ---
             if my_energy < 0.0
                 data_cpu.alive[ind] = 0.0
                 x = data_cpu.pool_x[ind]; y = data_cpu.pool_y[ind]; z = data_cpu.pool_z[ind]
                 size_bin = find_species_size_bin(data_cpu.length[ind], sp, size_bin_thresholds_cpu)
-                if size_bin > 0
-                    smort_cpu[x, y, z, sp, size_bin] += my_weight_ind
+                # Smort_cpu gets accumulated school biomass (my_weight_ind * my_abundance) instead of individual weight
+                if size_bin > 0 && 1 <= x <= size(smort_cpu,1) && 1 <= y <= size(smort_cpu,2) && 1 <= z <= size(smort_cpu,3)
+                    smort_cpu[x, y, z, sp, size_bin] += (my_weight_ind * my_abundance)
                 end
             end
 
-            # --- Senescence ---
-            # Treat the size-dependent term as an ANNUAL instantaneous hazard and
-            # convert to a per-timestep probability, so the senescence schedule is
-            # invariant to dt (the old per-step form made weekly vs 5-min runs
-            # die at wildly different effective rates).
-            senescence_rate_annual = exp(50.0 * (my_length / max_size - 0.95))  # yr^-1
-            minutes_per_year = 365.0 * 1440.0
-            senescence_prob_step = 1.0 - exp(-senescence_rate_annual * (dt / minutes_per_year))
-            if rand(Float32) < senescence_prob_step
+            # --- Senescence (Strict Maximum Age Cutoff) ---
+            # Senescence now acts strictly as a terminal cutoff at Max_Age (e.g., 25 years),
+            # rather than building up an exponential probability hazard curve over time.
+            A_max_years = (hasproperty(p_cpu, :Max_Age) && p_cpu.Max_Age.second[sp] > 0) ?
+                          Float64(p_cpu.Max_Age.second[sp]) : 25.0
+            age_years = data_cpu.age[ind] / 365.0
+            
+            if age_years >= A_max_years
                 data_cpu.alive[ind] = 0.0
-                # Record as "other" (non-predation/starvation/fishing) mortality so
-                # the mortality budget closes against the abundance decline.
                 xo = data_cpu.pool_x[ind]; yo = data_cpu.pool_y[ind]; zo = data_cpu.pool_z[ind]
                 sbin_o = find_species_size_bin(data_cpu.length[ind], sp, size_bin_thresholds_cpu)
+                # Omort_cpu gets accumulated school biomass (my_weight_ind * my_abundance) instead of individual weight
                 if sbin_o > 0 && 1 <= xo <= size(omort_cpu,1) && 1 <= yo <= size(omort_cpu,2) && 1 <= zo <= size(omort_cpu,3)
-                    omort_cpu[xo, yo, zo, sp, sbin_o] += my_weight_ind
+                    omort_cpu[xo, yo, zo, sp, sbin_o] += (my_weight_ind * my_abundance)
                 end
             end
+        elseif (data_cpu.alive[ind] == 1.0)
+            # ===================================================================
+            # --- LARVAL AGENT BUFFER CLEANUP ---
+            # ===================================================================
+            # Reset larval buffers to prevent backlog.
+            data_cpu.ration_energy[ind] = 0.0
+            data_cpu.ration_biomass[ind] = 0.0
         end
     end
 
@@ -301,10 +400,7 @@ function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outp
     end
     
     # --- Process Reproduction on the CPU ---
-    # Agents only spawn when their reproductive energy pool reaches 5% of their total body energy (GSI threshold)
-    # This prevents them from continuously "micro-spawning" every single timestep during the spawning month.
-    # FIXED: Compares school reproductive energy to school body energy.
-    repro_inds = findall((data_cpu.repro_energy .> (data_cpu.biomass_school .* Float32(p_cpu.Energy_density.second[sp]) .* 0.05f0)) .& 
+    repro_inds = findall((data_cpu.repro_energy .> (data_cpu.biomass_school .* Float32(p_cpu.Energy_density.second[sp]) .* 0.01f0)) .& 
                          (data_cpu.alive .== 1.0) .& 
                          (data_cpu.age .> p_cpu.Larval_Duration.second[sp]))
 
@@ -316,12 +412,9 @@ function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outp
         )
 
         # --- Environmental & density-dependent recruitment inputs ---------------
-        # (a) Per-parent ambient temperature (drives thermal early-life survival).
         parent_temp = Float32.(temp_cpu[repro_inds])
 
-        # (b) Local conspecific spawner biomass per parent cell. Density-dependent
-        #     egg/larval survival uses this so Beverton-Holt compensation emerges
-        #     from LOCAL crowding rather than being imposed at the stock level.
+        # Local conspecific spawner biomass per parent cell.
         grid_r = model.depths.grid
         lonres_r = Int(grid_r[grid_r.Name .== "lonres", :Value][1])
         latres_r = Int(grid_r[grid_r.Name .== "latres", :Value][1])
@@ -340,8 +433,7 @@ function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outp
             for i in repro_inds
         ]
 
-        # (c) Recruitment parameters (per species), read from recruitment_env file
-        #     if present, otherwise literature-based King-Mackerel-style defaults.
+        # Recruitment parameters (per species)
         T_opt, T_sd, dd_beta, sigma_R = read_recruitment_params(model, sp, spawner_map)
 
         repro_result = calculate_new_offspring_cpu(
@@ -356,9 +448,6 @@ function energy!(model::MarineModel, sp::Int, temp::AbstractArray, indices, outp
             new_offspring, daily_births_update = repro_result
             model.daily_birth_counters[sp] = daily_births_update
 
-            # calculate_new_offspring_cpu returns (nothing, daily_births) when no
-            # parent produced a whole egg this season, so guard on new_offspring
-            # (the tuple itself is never `nothing`).
             num_new = new_offspring === nothing ? 0 : length(new_offspring.x)
 
             if num_new > 0

@@ -6,7 +6,13 @@
 # output interval), the rate denominator falls back to the current standing
 # biomass; thereafter it is the standing biomass at the START of each interval.
 const _BIOMASS_REF_READY = Ref(false)
-reset_biomass_ref_state!() = (_BIOMASS_REF_READY[] = false; nothing)
+const _LAST_ITERATION = Ref(0)
+
+reset_biomass_ref_state!() = (
+    _BIOMASS_REF_READY[] = false; 
+    _LAST_ITERATION[] = 0; 
+    nothing
+)
 
 """
     timestep_results(sim::MarineSimulation)
@@ -35,7 +41,7 @@ function timestep_results(sim::MarineSimulation)
     !isdir(population_dir) && mkpath(population_dir)
 
     # --- 1. Gather individual data for CSV output ---
-    Sp, Ind, x, y, z, lengths, abundance, biomass, gut_fullness, ration_biomass, ration_energy, energy, cost, age, generation = [],[],[],[],[],[],[],[],[],[],[],[],[],[],[]
+    Sp, Ind, x, y, z, lengths, abundance, biomass, biomass_init, gut_fullness, ration_biomass, ration_energy, energy, cost, age, generation = [],[],[],[],[],[],[],[],[],[],[],[],[],[],[],[]
 
     for (species_index, animal) in enumerate(model.individuals.animals)
         spec_dat = animal.data
@@ -53,6 +59,7 @@ function timestep_results(sim::MarineSimulation)
         append!(abundance, Array(spec_dat.abundance)[alive_mask])
         # Match biomass_school as defined in the agent StructArray
         append!(biomass, Array(spec_dat.biomass_school)[alive_mask])
+        append!(biomass_init, Array(spec_dat.biomass_init)[alive_mask])
         append!(gut_fullness, Array(spec_dat.gut_fullness)[alive_mask])
         append!(ration_biomass, Array(spec_dat.ration_biomass)[alive_mask])
         append!(ration_energy, Array(spec_dat.ration_energy)[alive_mask])
@@ -63,23 +70,28 @@ function timestep_results(sim::MarineSimulation)
     end
     
     # Save individual data to CSV
-    # FIX: Changed naming convention to use underscores to match analysis scripts
+    # FIX: Exporting Biomass_init prevents post-predation biomass deflation from skewing % ration plots.
     ind_df = DataFrame(
         Species = Sp, Individual = Ind, X = x, Y = y, Z = z, 
-        Length = lengths, Abundance = abundance, Biomass = biomass, 
+        Length = lengths, Abundance = abundance, Biomass = biomass, Biomass_init = biomass_init,
         Fullness = gut_fullness, Ration_b = ration_biomass, Ration_e = ration_energy, 
         Energy = energy, Cost = cost, Age = age, Generation = generation
     )
     CSV.write(joinpath(individual_dir, "IndividualResults_$(run)_$(ts).csv"), ind_df)
 
-    # --- 2. Generate Population Arrays ---
-    # Populate the spatial biomass- and abundance-by-size grids from the living
-    # agents (and resource biomass). Previously this was a no-op, so the Biomass
-    # dataset was always written as zeros.
+    # --- 2. Calculate time interval in Years for annualizing rates ---
+    elapsed_iterations = _BIOMASS_REF_READY[] ? (model.iteration - _LAST_ITERATION[]) : model.iteration
+    if elapsed_iterations <= 0
+        elapsed_iterations = 1
+    end
+    interval_minutes = elapsed_iterations * model.dt
+    interval_years = Float32(interval_minutes / (365.0 * 1440.0))
+
+    # --- 3. Generate Spatially-Explicit Population Arrays (Annualized) ---
+    # Populate the spatial biomass- and abundance-by-size grids from the living agents
     populate_population_grids!(model, outputs)
 
-    # Denominator = standing biomass-by-size at the START of this interval
-    # (biomass_ref); on the first interval fall back to current biomass.
+    # Denominator = standing biomass-by-size at the START of this interval (biomass_ref)
     denom = _BIOMASS_REF_READY[] ? outputs.biomass_ref : outputs.biomass
 
     arch_arr = array_type(arch)
@@ -89,19 +101,19 @@ function timestep_results(sim::MarineSimulation)
     O_rate = arch_arr(zeros(Float32, size(outputs.Omort)))
 
     kF = fishing_mortality_kernel!(device(arch), (8, 8, 1, 1, 1, 1), size(outputs.Fmort))
-    kF(F_rate, denom, outputs.Fmort)
+    kF(F_rate, denom, outputs.Fmort, interval_years)
     kS = starvation_mortality_kernel!(device(arch), (8, 8, 1, 1, 1), size(outputs.Smort))
-    kS(S_rate, denom, outputs.Smort)
+    kS(S_rate, denom, outputs.Smort, interval_years)
     kP = starvation_mortality_kernel!(device(arch), (8, 8, 1, 1, 1), size(outputs.Pmort))
-    kP(P_rate, denom, outputs.Pmort)
+    kP(P_rate, denom, outputs.Pmort, interval_years)
     kO = starvation_mortality_kernel!(device(arch), (8, 8, 1, 1, 1), size(outputs.Omort))
-    kO(O_rate, denom, outputs.Omort)
+    kO(O_rate, denom, outputs.Omort, interval_years)
     KernelAbstractions.synchronize(device(arch))
 
-    cpu_F        = Array(F_rate)
-    cpu_S        = Array(S_rate)
-    cpu_P        = Array(P_rate)
-    cpu_O        = Array(O_rate)
+    cpu_F       = Array(F_rate)
+    cpu_S       = Array(S_rate)
+    cpu_P       = Array(P_rate)
+    cpu_O       = Array(O_rate)
     cpu_biomass  = Array(outputs.biomass)
     cpu_abund    = Array(outputs.abundance)
 
@@ -109,7 +121,7 @@ function timestep_results(sim::MarineSimulation)
     cpu_DC = dropdims(sum(cpu_DC_full, dims = 7), dims = 7)  # [lon,lat,depth,pred_sp,prey_sp,pred_bin]
     cpu_DC_full = nothing
 
-    # --- 3. Save spatially-explicit Population Results to HDF5 ---
+    # Save spatially-explicit Population Results to HDF5
     h5_path = joinpath(population_dir, "Population_Results_$(run)_$(ts).h5")
     h5open(h5_path, "w") do file
         file["F",         deflate = 4, shuffle = true] = cpu_F   # fishing      [lon,lat,depth,fishery,sp,bin]
@@ -121,11 +133,14 @@ function timestep_results(sim::MarineSimulation)
         file["Abundance", deflate = 4, shuffle = true] = cpu_abund
     end
 
-    # --- 3b. Spatially-integrated mortality time series (one row per species) ---
+    # --- 3b. Spatially-integrated mortality time series (Annualized) ---
     bmort = Array(outputs.Fmort); smort = Array(outputs.Smort)
     pmort = Array(outputs.Pmort); omort = Array(outputs.Omort)
     cpu_denom = Array(denom)
-    inst(kill, bio) = (bio > 0f0) ? -log(max(1f-6, 1f0 - clamp(kill / bio, 0f0, 1f0))) : 0f0
+    
+    # Mathematical correction: Dividies the instant rate by elapsed years to get a true annual rate (Z)
+    inst(kill, bio) = (bio > 0f0 && interval_years > 0.0f0) ? -log(max(1f-6, 1f0 - clamp(kill / bio, 0f0, 1f0))) / interval_years : 0f0
+    
     ts_path = joinpath(population_dir, "MortalityTimeSeries_$(run).csv")
     write_header = !isfile(ts_path)
     open(ts_path, "a") do io
@@ -149,7 +164,9 @@ function timestep_results(sim::MarineSimulation)
     fill!(outputs.Omort, 0.0f0)
     fill!(outputs.consumption, 0.0f0)
     copyto!(outputs.biomass_ref, outputs.biomass)
+    
     _BIOMASS_REF_READY[] = true
+    _LAST_ITERATION[] = model.iteration
 end
 
 """
@@ -239,9 +256,7 @@ end
 
 Aggregate living-agent biomass and abundance into the spatially explicit,
 size-structured population grids (`outputs.biomass`, `outputs.abundance`),
-and add resource biomass into the resource-species slots. This replaces the
-former `init_biomass_by_size!`, which only zeroed `outputs.biomass` and left
-the aggregation kernels (defined but never launched) unused.
+and add resource biomass into the resource-species slots.
 """
 function populate_population_grids!(model, outputs)
     arch = model.arch
@@ -302,9 +317,9 @@ end
 end
 
 """
-Calculates instantaneous fishing mortality (F) from the 6D fishing mortality array.
+Calculates instantaneous fishing mortality (F) from the 6D fishing mortality array (Annualized).
 """
-@kernel function fishing_mortality_kernel!(Rate, biomass_by_size, fishing_mortality)
+@kernel function fishing_mortality_kernel!(Rate, biomass_by_size, fishing_mortality, interval_years::Float32)
     lon, lat, depth, fishery, prey_sp, prey_bin = @index(Global, NTuple)
     
     @inbounds if fishing_mortality[lon, lat, depth, fishery, prey_sp, prey_bin] > 0
@@ -317,23 +332,23 @@ Calculates instantaneous fishing mortality (F) from the 6D fishing mortality arr
             mort_frac = clamp(mort_frac, FT(0.0), FT(1.0))
             
             if mort_frac < FT(1.0)
-                Rate[lon, lat, depth, fishery, prey_sp, prey_bin] = -log(FT(1.0) - mort_frac)
+                Rate[lon, lat, depth, fishery, prey_sp, prey_bin] = -log(FT(1.0) - mort_frac) / FT(interval_years)
             else
-                Rate[lon, lat, depth, fishery, prey_sp, prey_bin] = FT(10.0)
+                Rate[lon, lat, depth, fishery, prey_sp, prey_bin] = FT(10.0) / FT(interval_years)
             end
         end
     end
 end
 
 """
-Calculates instantaneous starvation mortality (S) from the 5D Smort array.
+Calculates instantaneous starvation/predation/other mortality from raw arrays (Annualized).
 """
-@kernel function starvation_mortality_kernel!(Rate, biomass_by_size, starvation_mortality)
+@kernel function starvation_mortality_kernel!(Rate, biomass_by_size, mortality, interval_years::Float32)
     lon, lat, depth, sp, size_bin = @index(Global, NTuple)
     
-    @inbounds if starvation_mortality[lon, lat, depth, sp, size_bin] > 0
+    @inbounds if mortality[lon, lat, depth, sp, size_bin] > 0
         biomass_val = biomass_by_size[lon, lat, depth, sp, size_bin]
-        mort_val = starvation_mortality[lon, lat, depth, sp, size_bin]
+        mort_val = mortality[lon, lat, depth, sp, size_bin]
         
         @inbounds if biomass_val > 0
             FT = eltype(Rate)
@@ -341,9 +356,9 @@ Calculates instantaneous starvation mortality (S) from the 5D Smort array.
             mort_frac = clamp(mort_frac, FT(0.0), FT(1.0))
             
             if mort_frac < FT(1.0)
-                Rate[lon, lat, depth, sp, size_bin] = -log(FT(1.0) - mort_frac)
+                Rate[lon, lat, depth, sp, size_bin] = -log(FT(1.0) - mort_frac) / FT(interval_years)
             else
-                Rate[lon, lat, depth, sp, size_bin] = FT(10.0)
+                Rate[lon, lat, depth, sp, size_bin] = FT(10.0) / FT(interval_years)
             end
         end
     end
@@ -355,11 +370,7 @@ end
 """
     save_checkpoint(sim)
 
-Serialize enough model state to resume a run: the per-species agent data
-(moved to the host for portable serialization), the resource biomass grid,
-fishery state, calendar counters, and the iteration counter. Written
-atomically (via a temp file + rename) so a crash mid-write cannot corrupt
-an existing checkpoint. Essential for long cloud runs on preemptible nodes.
+Serialize enough model state to resume a run.
 """
 function save_checkpoint(sim::MarineSimulation)
     model = sim.model
@@ -398,9 +409,7 @@ end
 """
     load_checkpoint!(sim, path)
 
-Restore model state previously written by `save_checkpoint`. The agent
-StructArrays are rebuilt directly on the target architecture so the device
-buffers exactly match the checkpoint, regardless of the current `maxN`.
+Restore model state previously written by `save_checkpoint`.
 """
 function load_checkpoint!(sim::MarineSimulation, path::String)
     model = sim.model
@@ -421,6 +430,10 @@ function load_checkpoint!(sim::MarineSimulation, path::String)
     for (i, f) in enumerate(state.fishing)
         model.fishing[i] = f
     end
+
+    # Restore the analytics interval tracker
+    _LAST_ITERATION[] = model.iteration
+    _BIOMASS_REF_READY[] = true
 
     @info "Resumed from checkpoint: $path (iteration $(model.iteration))"
     return nothing

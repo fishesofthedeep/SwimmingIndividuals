@@ -2,6 +2,45 @@
 # Agent Creation and Initialization
 # ===================================================================
 
+"""
+    approximate_initial_age(length_mm::Real, max_size_mm::Real, max_age_years::Real, larval_duration_days::Real)
+
+Approximates the age of an agent (in days) given its current length, maximum asymptotic length, 
+and maximum physical age. Assumes that individuals reach 95% of their maximum length at their maximum age.
+Clamps values safely to avoid numerical log-domain exceptions.
+"""
+function approximate_initial_age(
+    length_mm::Real, 
+    max_size_mm::Real, 
+    max_age_years::Real, 
+    larval_duration_days::Real
+)
+    # 1. Check for basic parameter validity
+    if max_size_mm <= 0.0 || max_age_years <= 0.0
+        return Float64(larval_duration_days) + 1.0
+    end
+
+    # 2. Convert maximum age in years to days
+    max_age_days = max_age_years * 365.0
+
+    # 3. Solve for the implicit von Bertalanffy growth constant (K)
+    # Assuming length(max_age_days) = 0.95 * max_size_mm
+    K = -log(0.05) / max_age_days
+
+    # 4. Safe relative size check to prevent domain errors with log(1 - ratio)
+    # Clamps starting sizes between 1% and 98% of maximum size
+    ratio = Float64(length_mm) / Float64(max_size_mm)
+    ratio_safe = clamp(ratio, 0.01, 0.75)
+
+    # 5. Invert the growth formula to extract the post-larval age in days
+    post_larval_age_days = -log(1.0 - ratio_safe) / K
+
+    # 6. Total starting age is larval duration plus post-larval growth age
+    total_initial_age_days = Float64(larval_duration_days) + post_larval_age_days
+
+    return total_initial_age_days
+end
+
 function construct_individuals(arch::Architecture, params::Dict, maxN)
     # Defines the full data structure for an agent.
     rawdata = StructArray(
@@ -35,7 +74,7 @@ function construct_individuals(arch::Architecture, params::Dict, maxN)
 
     data = replace_storage(array_type(arch), rawdata)
 
-    param_names=(:Dive_Interval,:Min_Prey,:LWR_b, :Surface_Interval,:Resp_b,:SpeciesLong, :LWR_a, :Max_Stomach_a, :Larval_Size,:Max_Prey, :Max_Size,:Resp_q,:School_Size,:Activity_Mult,:Taxa, :Larval_Duration,:Max_Stomach_b, :Sex_Ratio,:SpeciesShort,:M, :Handling_Time,:Dive_Min_Night,:Energy_density,:Min_Size, :Hatch_Survival, :MR_type, :Dive_Min_Day, :Dive_Max_Day, :Swim_velo, :Biomass,:Dive_Max_Night,:L_mat,:Resp_a, :Type)
+    param_names=(:Max_Age,:Dive_Interval,:Min_Prey,:LWR_b, :Surface_Interval,:Resp_b,:SpeciesLong, :LWR_a, :Max_Stomach_a, :Larval_Size,:Max_Prey, :Max_Size,:Resp_q,:School_Size,:Activity_Mult,:Taxa, :Larval_Duration,:Max_Stomach_b, :Sex_Ratio,:SpeciesShort,:M, :Handling_Time,:Dive_Min_Night,:Energy_density,:Min_Size, :Hatch_Survival, :MR_type, :Dive_Min_Day, :Dive_Max_Day, :Swim_velo, :Biomass,:Dive_Max_Night,:L_mat,:Resp_a, :Type)
     
     p = NamedTuple{param_names}(params)
     return plankton(data, p)
@@ -117,14 +156,24 @@ function initialize_individuals(arch, plank, B::Float32, sp::Int, depths::Marine
         
         cpu_x, cpu_y, cpu_pool_x, cpu_pool_y = res.lons, res.lats, res.grid_x, res.grid_y
         cpu_z = gaussmix(n_agents, night_profs[sp, "mu1"], night_profs[sp, "mu2"], night_profs[sp, "mu3"], 
-                                 night_profs[sp, "sigma1"], night_profs[sp, "sigma2"], night_profs[sp, "sigma3"], 
-                                 night_profs[sp, "lambda1"], night_profs[sp, "lambda2"])
+                                  night_profs[sp, "sigma1"], night_profs[sp, "sigma2"], night_profs[sp, "sigma3"], 
+                                  night_profs[sp, "lambda1"], night_profs[sp, "lambda2"])
         cpu_z = clamp.(cpu_z, 1.0, maxdepth)
         cpu_pool_z = max.(1, ceil.(Int, cpu_z ./ (maxdepth / depthres)))
         cpu_pool_z = clamp.(cpu_pool_z, 1, Int(depthres))
-        cpu_mature = min.(1.0, cpu_lengths ./ plank.p.L_mat[2][sp])
+
+        cpu_mature = Float32.(cpu_lengths .>= plank.p.L_mat[2][sp])
+        
         cpu_vis_prey = visual_range_preys_init(cpu_lengths, cpu_z, plank.p.Min_Prey[2][sp], plank.p.Max_Prey[2][sp], n_agents) .* dt
         
+        # Estimate initial age in days dynamically from starting length
+        max_age = (plank.p.Max_Age[2][sp] > 0) ? Float64(plank.p.Max_Age[2][sp]) : 25.0
+        larval_duration = Float64(plank.p.Larval_Duration[2][sp])
+        cpu_ages = zeros(Float32, n_agents)
+        for i in 1:n_agents
+            cpu_ages[i] = Float32(approximate_initial_age(cpu_lengths[i], max_size, max_age, larval_duration))
+        end
+
         # --- 4. Copy all data from CPU arrays to the target device (CPU or GPU) in one batch ---
         copyto!(plank.data.unique_id, 1, cpu_unique_ids, 1, n_agents)
         copyto!(plank.data.length, 1, cpu_lengths, 1, n_agents)
@@ -140,14 +189,14 @@ function initialize_individuals(arch, plank, B::Float32, sp::Int, depths::Marine
         copyto!(plank.data.pool_z, 1, cpu_pool_z, 1, n_agents)
         copyto!(plank.data.mature, 1, cpu_mature, 1, n_agents)
         copyto!(plank.data.vis_prey, 1, cpu_vis_prey, 1, n_agents)
+        copyto!(plank.data.age, 1, cpu_ages, 1, n_agents)
         
         # Initialize other fields
         @views plank.data.alive[1:n_agents] .= 1.0
         @views plank.data.generation[1:n_agents] .= 1
-        @views plank.data.energy[1:n_agents] .= plank.data.biomass_ind[1:n_agents] .* plank.data.abundance[1:n_agents] .* plank.p.Energy_density[2][sp] .* 0.2
+        @views plank.data.energy[1:n_agents] .= plank.data.biomass_ind[1:n_agents] .* plank.data.abundance[1:n_agents] .* plank.p.Energy_density[2][sp]
         # Portable RNG: draw on the host and copy to the device (works on CPU/GPU).
         copyto!(plank.data.gut_fullness, 1, rand(Float32, n_agents), 1, n_agents)
-        @views plank.data.age[1:n_agents] .= plank.p.Larval_Duration[2][sp]+1
         
         # Set remaining unused slots to non-alive
         @views plank.data.alive[n_agents+1:end] .= 0.0
@@ -306,17 +355,49 @@ function resource_growth!(model::MarineModel, current_date)
     arch = model.arch
     
     # --- 1. Get the seasonal multipliers for the current month ---
-    # PERFORMANCE NOTE: CSV.read is extremely slow to do every timestep. 
-    # Consider loading this into model.files or model.environment during setup_and_run_model!
     seasonality_df = cached_csv_for(model.files, "growth_seasonality")
     
     # Get the multipliers for the current month
     current_month_name = Dates.monthname(current_date)
-    monthly_multipliers = seasonality_df[!, current_month_name]
 
     # --- 2. Calculate the adjusted growth rates ---
     # Get the base annual growth rates from the main trait file
     annual_growth_rates = model.resource_trait.Growth
+    n_res = length(annual_growth_rates)
+    
+    # Align multipliers to each resource species by matching names to prevent DimensionMismatch
+    monthly_multipliers = ones(Float64, n_res)
+    
+    species_col = "Species" in names(seasonality_df) ? "Species" :
+                  "SpeciesLong" in names(seasonality_df) ? "SpeciesLong" :
+                  "SpeciesShort" in names(seasonality_df) ? "SpeciesShort" : nothing
+                  
+    if species_col !== nothing && current_month_name in names(seasonality_df)
+        for r in 1:n_res
+            sp_name = model.resource_trait.SpeciesLong[r]
+            ridx = findfirst(==(sp_name), seasonality_df[!, species_col])
+            if ridx !== nothing
+                val = seasonality_df[ridx, current_month_name]
+                if !ismissing(val)
+                    monthly_multipliers[r] = Float64(val)
+                end
+            end
+        end
+    elseif current_month_name in names(seasonality_df)
+        # Fallback index alignment: extract matching resource slice if ecosystem rows are present
+        n_rows = size(seasonality_df, 1)
+        n_species = hasproperty(model, :n_species) ? model.n_species : length(model.individuals.animals)
+        start_row = (n_rows == n_species + n_res) ? n_species + 1 : 1
+        for r in 1:n_res
+            row_idx = start_row + r - 1
+            if row_idx <= n_rows
+                val = seasonality_df[row_idx, current_month_name]
+                if !ismissing(val)
+                    monthly_multipliers[r] = Float64(val)
+                end
+            end
+        end
+    end
     
     # Apply the seasonal multiplier to the base rates
     adjusted_annual_rates = annual_growth_rates .* monthly_multipliers
@@ -326,12 +407,6 @@ function resource_growth!(model::MarineModel, current_date)
     per_timestep_rates = array_type(arch)(Float32.(adjusted_annual_rates ./ (minutes_per_year / model.dt)))
 
     # --- 2b. Primary-production multiplier on carrying capacity K --------------
-    # When time-varying ASC forcing is active and an `npp` (LayerRelPP) variable is
-    # present, scale each cell's carrying capacity by the normalised NPP ratio for
-    # the current month. Productivity sets the standing stock a cell can support, so
-    # NPP multiplies K (not the intrinsic rate r); a ratio of 1 reproduces the
-    # trait-table baseline. If no ASC/NPP forcing is active this is a no-op (the
-    # kernel receives an all-ones map) and behaviour is identical to before.
     lonres, latres = size(model.resources.biomass, 1), size(model.resources.biomass, 2)
     npp_mult_cpu = current_npp_multiplier(model, current_date)   # lon×lat or nothing
     if npp_mult_cpu === nothing
@@ -383,7 +458,7 @@ function calculate_new_offspring_cpu(p_cpu, parent_data, repro_energy_list, spaw
         if !isfinite(parent_data.biomass_ind[i]) || parent_data.biomass_ind[i] <= 0.0f0
             @warn """
             DIAGNOSTIC: Invalid parent biomass detected before reproduction.
-            Parent Index: $i, Species: $sp, Biomass: $(parent_data.biomass_ind[i])
+            Parent Index: \$i, Species: \$sp, Biomass: \$(parent_data.biomass_ind[i])
             Excluding this parent from reproduction.
             """
             repro_energy_list[i] = 0.0f0 # Exclude this parent by zeroing its reproductive energy
@@ -402,38 +477,6 @@ function calculate_new_offspring_cpu(p_cpu, parent_data, repro_energy_list, spaw
     # ===================================================================
     # Environmentally-driven, density-dependent, and stochastic recruitment.
     # ===================================================================
-    # The base calculation above is the deterministic egg-energy budget. We now
-    # convert egg production into *realised* recruits by multiplying through three
-    # survival/process terms, each of which is a no-op under its default so the
-    # original behaviour is recovered when recruitment parameters are absent.
-    #
-    #  (1) TEMPERATURE-DEPENDENT EARLY-LIFE SURVIVAL (environmental driver).
-    #      A Gaussian thermal window for egg/larval survival centred on T_opt with
-    #      width T_sd, evaluated at each parent's ambient temperature. This is the
-    #      standard "thermal performance / spawning-habitat suitability" form used
-    #      for recruitment in temperature-driven fish models (e.g. Pörtner & Peck
-    #      2010 J. Fish Biol.; Hare et al. 2010 for SST-recruitment links; SEDAR
-    #      King Mackerel work links recruitment to spring/summer SST). For King
-    #      Mackerel a spawning/larval optimum near 26-28 C is appropriate.
-    #
-    #  (2) DENSITY-DEPENDENT COMPENSATION (emergent Beverton-Holt).
-    #      Early-life survival declines with LOCAL conspecific spawner biomass as
-    #      1/(1 + dd_beta * local_spawner_biomass). Because egg production is ~linear
-    #      in spawner energy (≈ proportional to local SSB) while per-egg survival
-    #      falls as local SSB rises, the realised recruits-vs-SSB curve saturates:
-    #      this *is* Beverton-Holt compensation, but it EMERGES from local crowding
-    #      rather than being imposed as a stock-level function (Beverton & Holt 1957;
-    #      the local-density formulation follows the spatial/IBM compensation logic
-    #      in e.g. Rose et al. 2001 and the "emergent density dependence" discussion
-    #      in DeAngelis & Grimm 2014). dd_beta=0 disables it.
-    #
-    #  (3) RECRUITMENT PROCESS ERROR (interannual variability).
-    #      A single lognormal deviation per spawning event, exp(sigma_R*z - sigma_R^2/2)
-    #      with z~N(0,1), bias-corrected to mean 1. This is the standard
-    #      log-normal recruitment deviation of stock-assessment practice (Methot &
-    #      Wetzel 2013, Stock Synthesis; Thorson et al. 2014 on sigma_R), and is the
-    #      single highest-leverage change for producing realistic dynamic SSB/recruit
-    #      trends. sigma_R=0 disables it.
     n_parents = length(num_eggs_per_parent_float)
 
     # (3) one cohort-level deviation, shared across this spawning event
@@ -462,9 +505,9 @@ function calculate_new_offspring_cpu(p_cpu, parent_data, repro_energy_list, spaw
         invalid_indices = findall(!isfinite, num_eggs_per_parent_float)
         @warn """
         DIAGNOSTIC: Non-finite number (Inf/NaN) detected in egg calculation.
-        Species: $sp
-        Problematic Parent Indices: $invalid_indices
-        Problematic Values: $(num_eggs_per_parent_float[invalid_indices])
+        Species: \$sp
+        Problematic Parent Indices: \$invalid_indices
+        Problematic Values: \$(num_eggs_per_parent_float[invalid_indices])
         """
         # Replace non-finite values with 0 to prevent them from propagating
         num_eggs_per_parent_float[invalid_indices] .= 0.0f0
@@ -503,8 +546,8 @@ function calculate_new_offspring_cpu(p_cpu, parent_data, repro_energy_list, spaw
         if !isfinite(px) || !isfinite(py) || !isfinite(pz)
             @warn """
             DIAGNOSTIC: Invalid parent coordinates detected! Offspring would inherit bad data.
-            Parent Index: $parent_idx, Species: $sp
-            Parent Coords (x,y,z): ($px, $py, $pz)
+            Parent Index: \$parent_idx, Species: \$sp
+            Parent Coords (x,y,z): (\$px, \$py, \$pz)
             Skipping creation of this offspring.
             """
             # Set values to zero so this new agent is effectively inert
@@ -552,7 +595,7 @@ function calculate_new_offspring_cpu(p_cpu, parent_data, repro_energy_list, spaw
     if any(!isfinite, new_biomass_school) || any(!isfinite, new_energy)
         @error """
         FATAL DIAGNOSTIC: Attempting to return new agents with invalid biomass or energy!
-        Species: $sp
+        Species: \$sp
         Halting to prevent data corruption.
         """
         # This is a critical error, so we stop the simulation
